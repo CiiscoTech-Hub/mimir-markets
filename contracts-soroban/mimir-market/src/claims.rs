@@ -226,9 +226,6 @@ pub fn challenge_claim(
 pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
     let mut claim = storage::get_claim(env, claim_id)?;
     claim.creator.require_auth();
-    if claim.state == ClaimState::Cancelled || claim.state == ClaimState::Active {
-        return Ok(());
-    }
     if claim.state != ClaimState::Open {
         return Err(Error::ClaimNotOpen);
     }
