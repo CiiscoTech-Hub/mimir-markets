@@ -24,7 +24,7 @@ use crate::escrow;
 use crate::events;
 use crate::fees;
 use crate::storage;
-use crate::types::{Challenger, Claim, ClaimState, Error, PayoutQuote, WinnerSide};
+use crate::types::{Challenger, Claim, ClaimState, Error, PayoutQuote, Verdict, WinnerSide};
 use crate::util;
 
 pub fn resolve_claim(
@@ -35,21 +35,133 @@ pub fn resolve_claim(
     confidence: u32,
     evidence_hash: BytesN<32>,
 ) -> Result<(), Error> {
+    resolve_claim_versioned(
+        env,
+        claim_id,
+        &Verdict::current(winner_side),
+        summary,
+        confidence,
+        evidence_hash,
+    )
+}
+
+/// The structural lifecycle check for a resolution, shared by
+/// `resolve_claim_versioned` and `preflight_claim` (#779).
+///
+/// Pure: reads no storage, writes nothing, takes only the claim and the current
+/// timestamp. The resolve path calls this *after* the idempotency-replay check
+/// so an exact replay of an already-resolved claim still succeeds; preflight
+/// calls it unconditionally because it is answering the caller's question about
+/// the *current* state, not deciding whether a replay is safe.
+///
+/// Returns the exact `Error` the resolve path used to return inline, so
+/// extracting this helper leaves `resolve_claim_versioned` behaviour
+/// byte-identical.
+pub(crate) fn check_resolvable(claim: &Claim, now: u64) -> Result<(), PreflightReason> {
+    if claim.state != ClaimState::Active {
+        return Err(PreflightReason::NotActive);
+    }
+    if now < claim.deadline {
+        return Err(PreflightReason::NotYetExpired);
+    }
+    Ok(())
+}
+
+/// Read-only preflight for a claim resolution (#779).
+///
+/// Answers "would the structural lifecycle checks pass right now?" without
+/// mutating any state and without requiring authorization. See
+/// [`ClaimPreflight`] for what the returned booleans mean and what this
+/// deliberately does NOT claim about a subsequent signed execution.
+pub fn preflight_claim(env: &Env, claim_id: u64) -> Result<ClaimPreflight, Error> {
+    let claim = storage::get_claim(env, claim_id)?;
+    let now = env.ledger().timestamp();
+
+    let mut missing: Vec<PreflightReason> = Vec::new(env);
+    let lifecycle_ok = match check_resolvable(&claim, now) {
+        Ok(()) => true,
+        Err(reason) => {
+            missing.push_back(reason);
+            false
+        }
+    };
+
+    // The oracle is required for any successful `resolve_claim` submission, so
+    // this is a property of the contract's auth model, not of the specific
+    // claim. Reported separately so a caller cannot confuse "structurally
+    // eligible" with "will succeed".
+    let requires_oracle_auth = true;
+
+    // No caller payload exists in a pure preflight, so there are no
+    // public-constraint rejections to report. A later overload that accepts
+    // a candidate `summary` can tighten this without changing the shape.
+    let constraints_ok = true;
+
+    Ok(ClaimPreflight {
+        eligible: lifecycle_ok && constraints_ok,
+        lifecycle_ok,
+        constraints_ok,
+        requires_oracle_auth,
+        missing_reasons: missing,
+    })
+}
+
+/// Versioned entry point. The verdict's encoding version is validated before
+/// any state is touched, so an unknown version fails closed with the claim left
+/// exactly as it was and the escrow untouched.
+pub fn resolve_claim_versioned(
+    env: &Env,
+    claim_id: u64,
+    verdict: &Verdict,
+    summary: String,
+    confidence: u32,
+    evidence_hash: BytesN<32>,
+) -> Result<(), Error> {
     storage::oracle(env)?.require_auth();
 
+    // Decode first: an unknown version must never be written, and `None` is not
+    // a settled verdict. Both refusals leave the claim untouched.
+    let winner_side = verdict.decode()?;
+
     let mut claim = storage::get_claim(env, claim_id)?;
-    if claim.state != ClaimState::Active {
-        return Err(Error::ClaimNotActive);
+    if claim.state == ClaimState::Resolved {
+        // Idempotent replay: same decoded verdict and inputs is a no-op.
+        if winner_side == claim.winner_side
+            && claim.resolution_summary == summary
+            && claim.confidence == confidence
+            && claim.evidence_hash == Some(evidence_hash.clone())
+        {
+            return Ok(());
+        }
     }
-    if env.ledger().timestamp() < claim.deadline {
-        return Err(Error::NotYetExpired);
+    // Shared with preflight_claim so the two cannot drift (#779). The mapping
+    // back to `Error` reproduces the exact variants this function returned
+    // before the helper was extracted.
+    match check_resolvable(&claim, env.ledger().timestamp()) {
+        Ok(()) => {}
+        Err(PreflightReason::NotActive) => return Err(Error::ClaimNotActive),
+        Err(PreflightReason::NotYetExpired) => return Err(Error::NotYetExpired),
+        Err(PreflightReason::ClaimNotFound) => return Err(Error::ClaimNotFound),
     }
-    if winner_side == WinnerSide::None {
-        return Err(Error::InvalidVerdict);
+    
+    // Emit deadline reached event for active claims entering settlement window
+    events::DeadlineReached {
+        id: claim_id,
+        deadline: claim.deadline,
+        challenger_count: claim.challenger_count,
+        total_staked: claim.creator_stake
+            .checked_add(claim.total_challenger_stake)
+            .ok_or(Error::Overflow)?,
     }
+    .publish(env);
+
     if confidence > 100 {
         return Err(Error::InvalidConfidence);
     }
+    // Bound the summary before any state is written. A claim created under the
+    // metadata budget must stay under it after resolution; an over-long summary
+    // is refused with the claim still Active and the escrow untouched.
+    util::validate_resolution_summary(&claim, &summary)?;
 
     claim.state = ClaimState::Resolved;
     claim.winner_side = winner_side;
@@ -57,7 +169,10 @@ pub fn resolve_claim(
     claim.confidence = confidence;
     claim.evidence_hash = Some(evidence_hash.clone());
 
-    let inflow = claim.creator_stake + claim.total_challenger_stake;
+    let inflow = claim
+        .creator_stake
+        .checked_add(claim.total_challenger_stake)
+        .ok_or(Error::Overflow)?;
     let usdc = storage::usdc(env)?;
     let mut paid = 0i128;
     let mut taken_fees = 0i128;
@@ -68,8 +183,8 @@ pub fn resolve_claim(
             let (owed, taken) =
                 fees::apply_fees(env, claim_id, claim.creator_stake, inflow, &claim.fees)?;
             escrow::push_or_park(env, &usdc, &claim.creator, owed);
-            paid += owed;
-            taken_fees += taken;
+            paid = paid.checked_add(owed).ok_or(Error::Overflow)?;
+            taken_fees = taken_fees.checked_add(taken).ok_or(Error::Overflow)?;
             // Challengers are owed nothing.
             claim.remaining_escrow = 0;
         }
@@ -80,16 +195,18 @@ pub fn resolve_claim(
                 // challenger's profit, accumulated with the same formula at
                 // challenge time — so the unspent liability is known without
                 // walking the roster.
-                let refund = claim.creator_stake - claim.reserved_creator_liability;
+                let refund = claim.creator_stake.checked_sub(claim.reserved_creator_liability).ok_or(Error::InsufficientCreatorLiquidity)?;
                 if refund > 0 {
                     // Unspent liability returning to a LOSING creator is a
                     // partial refund of principal, not profit, so it carries no
                     // fee.
                     escrow::push_or_park(env, &usdc, &claim.creator, refund);
-                    paid += refund;
+                    paid = paid.checked_add(refund).ok_or(Error::Overflow)?;
                 }
-                claim.remaining_escrow =
-                    claim.total_challenger_stake + claim.reserved_creator_liability;
+                claim.remaining_escrow = claim
+                    .total_challenger_stake
+                    .checked_add(claim.reserved_creator_liability)
+                    .ok_or(Error::Overflow)?;
             } else {
                 // Pool mode: challengers share the creator's stake on top of
                 // their own.
@@ -101,19 +218,35 @@ pub fn resolve_claim(
         // stake would make the protocol the only winner of an ambiguous market.
         _ => {
             escrow::push_or_park(env, &usdc, &claim.creator, claim.creator_stake);
-            paid += claim.creator_stake;
+            paid = paid.checked_add(claim.creator_stake).ok_or(Error::Overflow)?;
             claim.remaining_escrow = claim.total_challenger_stake;
         }
     }
 
     // Conservation, asserted on chain: what has been paid, taken as fees, and
     // still owed to challengers can never exceed what came in.
-    if paid + taken_fees + claim.remaining_escrow > inflow {
+    let committed = paid
+        .checked_add(taken_fees)
+        .and_then(|value| value.checked_add(claim.remaining_escrow))
+        .ok_or(Error::Overflow)?;
+    if committed > inflow {
         return Err(Error::PayoutExceedsEscrow);
     }
 
-    let dust = inflow - paid - taken_fees - claim.remaining_escrow;
+    let dust = inflow.checked_sub(committed).ok_or(Error::PayoutExceedsEscrow)?;
+    
+    events::ClaimStateTransitioned {
+        id: claim_id,
+        from_state: ClaimState::Active as u32,
+        to_state: ClaimState::Resolved as u32,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
+    
     storage::set_claim(env, claim_id, &claim);
+    // Persist the verdict with its explicit version tag. `claim.winner_side`
+    // remains the compatibility mirror for callers that read the claim struct.
+    storage::set_verdict(env, claim_id, verdict);
     storage::bump_total_resolved(env);
 
     events::MarketSettled {
@@ -132,7 +265,34 @@ pub fn resolve_claim(
         evidence_hash,
     }
     .publish(env);
+    events::VerdictEncoded {
+        id: claim_id,
+        version: verdict.version,
+        winner_side,
+    }
+    .publish(env);
     Ok(())
+}
+
+/// The verdict for a resolved claim, decoded through its explicit version tag.
+///
+/// Read path:
+///   * a stored versioned verdict is validated and returned, so an unknown
+///     future version is refused instead of reinterpreted;
+///   * a claim with no versioned record (resolved before verdicts were
+///     versioned) falls back to `Claim.winner_side` and is reported as V1.
+pub fn get_verdict(env: &Env, claim_id: u64) -> Result<Verdict, Error> {
+    let claim = storage::get_claim(env, claim_id)?;
+    if let Some(stored) = storage::verdict(env, claim_id) {
+        // Validate on read as well as on write: a stored verdict whose version
+        // this contract does not understand must not be decoded as V1.
+        stored.decode()?;
+        return Ok(stored);
+    }
+    if claim.state != ClaimState::Resolved {
+        return Err(Error::ClaimNotResolved);
+    }
+    Verdict::from_unversioned(claim.winner_side)
 }
 
 // ── Per-challenger pull settlement ───────────────────────────────────────────
@@ -183,6 +343,12 @@ fn gross_for(
 
 /// Settle one challenger's position. Callable once per challenger once the claim
 /// is resolved, and O(1) in the number of challengers.
+///
+/// Duplicate prevention: each roster entry carries a `claimed` marker, and a
+/// second pull by the same challenger is rejected with
+/// [`Error::AlreadyClaimedPayout`]. The guard runs before any state is read for
+/// payout, so a duplicate can never draw the escrow down twice or advance the
+/// last-claimant branch.
 pub fn claim_challenger_payout(
     env: &Env,
     challenger: Address,
@@ -203,10 +369,19 @@ pub fn claim_challenger_payout(
     let (index, mut entry) =
         find_challenger(&roster, &challenger).ok_or(Error::NotAChallenger)?;
     if entry.claimed {
-        return Ok(0);
+        // Duplicate payout claim: this challenger has already pulled their
+        // settlement. Fail closed with the explicit error instead of a silent
+        // `Ok(0)`, so a retried or replayed pull is distinguishable from a
+        // genuinely zero payout and cannot be mistaken for a fresh settlement.
+        // No state is written and no funds move either way.
+        return Err(Error::AlreadyClaimedPayout);
     }
 
-    let is_last_claimant = claim.challenger_claims + 1 == claim.challenger_count;
+    let claim_number = claim
+        .challenger_claims
+        .checked_add(1)
+        .ok_or(Error::Overflow)?;
+    let is_last_claimant = claim_number == claim.challenger_count;
     let gross = gross_for(env, &claim, entry.stake, is_last_claimant)?;
 
     // The escrow can never owe more than it holds for this claim.
@@ -221,8 +396,12 @@ pub fn claim_challenger_payout(
     roster.set(index, entry.clone());
     storage::set_challengers(env, claim_id, &roster);
 
-    claim.remaining_escrow -= gross;
-    claim.challenger_claims += 1;
+    claim.remaining_escrow = claim
+        .remaining_escrow
+        .checked_sub(gross)
+        .ok_or(Error::PayoutExceedsEscrow)?;
+    claim.challenger_claims = claim_number;
+    util::assert_claim_conservation(&claim)?;
     storage::set_claim(env, claim_id, &claim);
 
     let usdc = storage::usdc(env)?;
@@ -272,7 +451,11 @@ pub fn quote_challenger_payout(
         });
     }
 
-    let is_last_claimant = claim.challenger_claims + 1 == claim.challenger_count;
+    let claim_number = claim
+        .challenger_claims
+        .checked_add(1)
+        .ok_or(Error::Overflow)?;
+    let is_last_claimant = claim_number == claim.challenger_count;
     let gross = gross_for(env, &claim, entry.stake, is_last_claimant)?;
     let (owed, fee) = fees::quote_fees(entry.stake, gross, &claim.fees)?;
     Ok(PayoutQuote {

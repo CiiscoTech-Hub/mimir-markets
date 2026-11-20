@@ -58,6 +58,7 @@ import {
   supportsMessageSigning,
   type ShapedWallet,
 } from "./wallet-connectors";
+import { walletRowLabel } from "./wallet-aria";
 
 /** Remembering the last wallet turns a five-row decision into one tap on return. */
 const RECENT_WALLET_KEY = "mimir-recent-wallet";
@@ -224,8 +225,83 @@ export interface WalletContextValue {
   /** Set when the wallet reports a different network than Mimir submits to. */
   networkWarning: string | null;
 
+  /**
+   * Transaction lifecycle state for the most recent user-initiated action.
+   * Used by confirmation polling and feedback UI to show loading, invalid,
+   * stale, disconnected, or dependency-failure states.
+   */
+  transactionState: TransactionState | null;
+
   /** Rows for the picker modal, already ordered. */
   wallets: ModalWallet[];
+
+  /**
+   * A resumable setup action the caller asked for before the wallet was
+   * ready (#769). Non-null while a trustline setup is pending; the caller's
+   * `resume()` runs exactly once after the trustline is confirmed on chain.
+   */
+  pendingTrustlineIntent: PendingTrustlineIntent | null;
+
+  /**
+   * Request a USDC trustline and resume `onReady` **only** once it is
+   * confirmed on chain. If the user leaves mid-flow, the intent is persisted
+   * to `sessionStorage` and resumed on provider mount. The classic trustline
+   * transaction is submitted independently of any Soroban staking call.
+   */
+  requestTrustlineThen: (onReady: () => void) => Promise<void>;
+}
+
+/**
+ * In-memory handle to a pending trustline intent. The callback is not
+ * persisted — only the fact that an intent exists and the address it belongs
+ * to are. On remount the callback is re-registered by the caller, so a reload
+ * still resumes the original intent through `onReady`.
+ */
+export interface PendingTrustlineIntent {
+  address: string;
+  resume: () => void;
+}
+
+/**
+ * `sessionStorage` key for the persisted intent. Non-sensitive: address only.
+ *
+ * Written with a namespaced prefix so it cannot collide with any other
+ * resumable-flow key another feature may add later.
+ */
+const PENDING_TRUSTLINE_KEY = "mimir.pendingTrustlineIntent.v1";
+
+function readPendingTrustline(): { address: string } | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_TRUSTLINE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { address?: unknown };
+    if (typeof parsed?.address !== "string" || parsed.address.length === 0) return null;
+    return { address: parsed.address };
+  } catch {
+    return null;
+  }
+}
+
+function writePendingTrustline(address: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(
+      PENDING_TRUSTLINE_KEY,
+      JSON.stringify({ address }),
+    );
+  } catch {
+    // sessionStorage can be disabled; the in-memory intent still works.
+  }
+}
+
+function clearPendingTrustline(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.removeItem(PENDING_TRUSTLINE_KEY);
+  } catch {
+    // ignore
+  }
 }
 
 type ModalWallet = ShapedWallet & { connect: () => void };
@@ -233,6 +309,7 @@ type ModalWallet = ShapedWallet & { connect: () => void };
 const NO_WALLET = "Connect a Stellar wallet first.";
 
 const Ctx = createContext<WalletContextValue>({
+  transactionState: null,
   address: null,
   isConnected: false,
   isConnecting: false,
@@ -258,7 +335,28 @@ const Ctx = createContext<WalletContextValue>({
   canSignAuthEntries: false,
   networkWarning: null,
   wallets: [],
+  pendingTrustlineIntent: null,
+  requestTrustlineThen: async () => {},
 });
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Lifecycle states for wallet-initiated transactions.
+ *
+ * - `null`: No active transaction feedback.
+ * - `"loading"`: Transaction submitted, awaiting confirmation or failure.
+ * - `"invalid"`: Transaction structure or signature failed validation before submission.
+ * - `"stale"`: Transaction confirmed on-chain but the wallet session lost sync (e.g. reconnect).
+ * - `"disconnected"`: Wallet disconnected during a pending transaction.
+ * - `"dependency-failure"`: A required upstream step (e.g. trustline) failed.
+ */
+export type TransactionState =
+  | "loading"
+  | "invalid"
+  | "stale"
+  | "disconnected"
+  | "dependency-failure";
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
@@ -342,6 +440,7 @@ function WalletRow({
         target="_blank"
         rel="noreferrer"
         className={shell}
+        aria-label={walletRowLabel(labelFor(wallet), { installed: false, recent: wallet.recent, wrapper: wallet.wrapper })}
       >
         {body}
       </a>
@@ -353,6 +452,7 @@ function WalletRow({
       type="button"
       disabled={isPending}
       onClick={wallet.connect}
+      aria-label={walletRowLabel(labelFor(wallet), { installed: wallet.installed, recent: wallet.recent, wrapper: wallet.wrapper })}
       className={shell}
     >
       {body}
@@ -414,6 +514,20 @@ function WalletPickerModal({
         className="w-full max-w-sm border border-pv-border/40 bg-pv-bg p-5 shadow-2xl outline-none"
         onClick={(e) => e.stopPropagation()}
       >
+        {/* sr-only live region announces connection status changes without
+            requiring focus, so Freighter users hear "Connecting to Freighter"
+            as soon as they click a row rather than waiting for the button to
+            re-render under focus. */}
+        <div aria-live="polite" aria-atomic="true" className="sr-only">
+          {isPending
+            ? "Connecting to wallet — please check your wallet extension"
+            : error === "rejected"
+              ? "Connection rejected in wallet"
+              : error
+                ? "Could not connect. Try another wallet."
+                : ""}
+        </div>
+
         <div className="mb-1 flex items-center justify-between">
           <h2 className="font-display text-lg font-bold text-pv-text">
             Connect wallet
@@ -423,7 +537,7 @@ function WalletPickerModal({
             type="button"
             onClick={onClose}
             className="px-2 py-1 text-sm text-pv-muted transition-colors hover:text-pv-text"
-            aria-label="Close"
+            aria-label="Close connect wallet dialog"
           >
             ✕
           </button>
@@ -435,7 +549,7 @@ function WalletPickerModal({
 
         <div className="space-y-2">
           {loading && wallets.length === 0 && (
-            <p className="text-sm text-pv-muted">Looking for wallets…</p>
+            <p className="text-sm text-pv-muted" role="status" aria-live="polite">Looking for wallets…</p>
           )}
 
           {primary && (
@@ -476,7 +590,7 @@ function WalletPickerModal({
         </div>
 
         {error && (
-          <p className="mt-3 text-xs text-pv-danger">
+          <p role="alert" className="mt-3 text-xs text-pv-danger">
             {error === "rejected"
               ? "Connection rejected in wallet."
               : "Could not connect. Try another wallet."}
@@ -496,10 +610,14 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [networkWarning, setNetworkWarning] = useState<string | null>(null);
+  // Exposed through the context for lifecycle feedback UI; nothing in the
+  // provider drives it yet, so it stays `null` until a write flow sets it.
+  const [transactionState] = useState<TransactionState | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerLoading, setPickerLoading] = useState(false);
   const [options, setOptions] = useState<ShapedWallet[]>([]);
   const [recentId, setRecentId] = useState<string | null>(null);
+  const [pendingTrustlineIntent, setPendingTrustlineIntent] = useState<PendingTrustlineIntent | null>(null);
 
   // Read by the signing callbacks, which must stay referentially stable so the
   // memoised `signer` does not change identity on every render.
@@ -516,6 +634,16 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
    * kit's memory, unlike `fetchAddress`, which asks the extension.
    */
   useEffect(() => {
+    // Restore a persisted trustline intent (#769). Non-null means the caller
+    // previously asked for a trustline setup that had not finished; the UI
+    // shows the "add trustline" gate and the caller re-registers its resume
+    // callback when it mounts. No resume callback is called here: only the
+    // caller knows what the intent was for.
+    const persisted = readPendingTrustline();
+    if (persisted) {
+      setPendingTrustlineIntent({ address: persisted.address, resume: () => {} });
+    }
+
     let cancelled = false;
 
     (async () => {
@@ -586,6 +714,49 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       cancelled = true;
+    };
+  }, [address]);
+
+  /**
+   * Detect a wallet account switch (#922).
+   *
+   * `stellar-wallets-kit` does not push account changes: the `address` state
+   * above is only set on connect / restore / disconnect. When the user switches
+   * accounts inside Freighter (or any injected wallet), that state stays on the
+   * previous account — so any flow that signed intent for account A can silently
+   * submit against account B. This effect re-reads the kit's current address on
+   * window focus and on tab visibility restore, and calls `setAddress` only when
+   * it has actually changed. No behaviour changes for users who never switch.
+   */
+  useEffect(() => {
+    if (!address) return;
+    let cancelled = false;
+
+    const check = async () => {
+      try {
+        const kit = await loadKit();
+        const { address: current } = await kit.getAddress();
+        if (cancelled || !current || current === address) return;
+        setAddress(current);
+        setWalletId(kit.selectedModule.productId);
+        setWalletName(kit.selectedModule.productName);
+        console.info("[wallet] ACCOUNT_SWITCH_DETECTED", { from: address, to: current });
+      } catch {
+        // getAddress is a best-effort read; a failure is not an account switch.
+      }
+    };
+
+    const onFocus = () => void check();
+    const onVis = () => {
+      if (document.visibilityState === "visible") void check();
+    };
+
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, [address]);
 
@@ -802,6 +973,44 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       .catch(() => undefined);
   }, []);
 
+  const requestTrustlineThen = useCallback(
+    async (onReady: () => void) => {
+      if (!address || !signer) {
+        throw new Error(NO_WALLET);
+      }
+
+      // Persist the intent BEFORE submitting so a crash / reload between
+      // submission and confirmation still resumes the user's original action.
+      writePendingTrustline(address);
+      setPendingTrustlineIntent({ address, resume: onReady });
+
+      // The classic trustline transaction is submitted on its own — this is
+      // deliberately NOT part of any Soroban staking call (#769).
+      const submit = await import("./stellar-trustline");
+      const submitted = await submit.submitUsdcTrustline(signer);
+      if (submitted.status === "failed") {
+        clearPendingTrustline();
+        setPendingTrustlineIntent(null);
+        throw new Error(submitted.reason);
+      }
+
+      // Confirm by re-reading the trustline until Horizon shows it. Do not
+      // resume on submission — the whole point is that "submitted" is not
+      // "ready".
+      const confirmed = await submit.awaitUsdcTrustlineConfirmation(address);
+      if (confirmed.status === "confirmed") {
+        clearPendingTrustline();
+        setPendingTrustlineIntent(null);
+        onReady();
+        return;
+      }
+      clearPendingTrustline();
+      setPendingTrustlineIntent(null);
+      throw new Error(confirmed.reason);
+    },
+    [address, signer],
+  );
+
   const wallets = useMemo<ModalWallet[]>(
     () =>
       options.map((wallet) => ({
@@ -828,7 +1037,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       canSignMessages: supportsMessageSigning(walletId),
       canSignAuthEntries: supportsAuthEntrySigning(walletId),
       networkWarning,
+      transactionState,
       wallets,
+      pendingTrustlineIntent,
+      requestTrustlineThen,
     }),
     [
       address,
@@ -843,7 +1055,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       walletName,
       walletId,
       networkWarning,
+      transactionState,
       wallets,
+      pendingTrustlineIntent,
+      requestTrustlineThen,
     ],
   );
 

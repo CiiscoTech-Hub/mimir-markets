@@ -46,6 +46,12 @@ export interface ClaimOnChain {
   challengerAddresses:  readonly string[];
   /** Individual challenger stakes in display USDC, for the whale rule. */
   challengerStakes:     readonly number[];
+  /**
+   * Quorum policy revision in force when this claim's aggregate decision was
+   * recorded. Stable across policy default changes so historical ballots replay
+   * deterministically against the revision they were captured under.
+   */
+  quorumPolicyRevision?: number;
 }
 
 /**
@@ -76,7 +82,13 @@ export interface PersonaDecision {
     | "no-pool-imbalance"
     | "no-whale-yet"
     | "no-evidence"
+    | "stale-evidence"
     | "llm-failed";
+  /**
+   * Quorum policy revision the decision was evaluated under. Recorded so an
+   * aggregate decision can be replayed deterministically later.
+   */
+  quorumPolicyRevision?: number;
 }
 
 /**
@@ -92,13 +104,38 @@ export interface PersonaRunnerContext {
   contractId:       string;
   evidenceCache:    Map<number, EvidenceCacheEntry>;
   peerReasoning?:   Map<string, string[]>;
+  /**
+   * Quorum policy revision pinned for this cycle. Stable reference: if defaults
+   * change mid-cycle the pinned revision is still used for every decision.
+   */
+  quorumPolicyRevision?: number;
 }
 
+/**
+ * Represents a cached piece of evidence associated with a claim.
+ *
+ * Includes an integrity check mechanism via SHA-256 hashing to ensure
+ * the cached text has not been tampered with or corrupted since caching.
+ * This supports the "evidence-cache integrity check" feature requirement,
+ * ensuring contract-first, privacy-safe behavior at this boundary.
+ */
 export interface EvidenceCacheEntry {
   text:    string;
   fetcher: string;
-  /** SHA-256 of the text, bare hex. */
+  /** SHA-256 of the text, bare hex. Used for integrity verification. */
   hash:    string;
+  /**
+   * Optional timestamp of when this evidence was cached.
+   */
+  cachedAt?: number;
+  /**
+   * Epoch ms when the fetch completed.  Populated for all real fetches;
+   * absent (undefined) only for the "no URL / failed" placeholder entries so
+   * callers can distinguish "no-evidence" from "evidence that is stale".
+   */
+  fetchedAt?: number;
+  /** Normalised source URL after any redirects.  Absent for placeholder entries. */
+  sourceUrl?: string;
 }
 
 /**

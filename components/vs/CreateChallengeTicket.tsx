@@ -2,6 +2,17 @@
 
 import { Activity } from "lucide-react";
 import { useTranslations } from "next-intl";
+import { useEffect, useMemo, useState } from "react";
+import {
+  CREATE_TICKET_BODY_CLASS,
+  CREATE_TICKET_META_GRID_CLASS,
+  CREATE_TICKET_SHELL_CLASS,
+  CREATE_TICKET_WATERMARK_CLASS,
+} from "@/lib/createFormResponsive";
+import { parsePrefillParams } from "@/lib/mirror-prefill";
+
+export type ChallengeSide = "yes" | "no";
+
 
 function truncate(s: string, max: number) {
   const t = s.trim();
@@ -39,6 +50,14 @@ export type CreateChallengeTicketProps = {
   stakeAmount: number;
   /** Dirección conectada para la línea AUTH_SIG; si no hay, se muestra un marcador. */
   walletAddress?: string | null;
+  /** Monto máximo permitido por mercado (suscripción). Usado para clamp. */
+  maxAmount?: number;
+  /** Query string de la URL actual (p. ej. `window.location.search`). */
+  searchParams?: string;
+  /** True when the connected account has changed since the last signed intent.
+   *  The ticket shows a review banner and hides the SIGNED watermark; the
+   *  parent is responsible for gating submission until re-authorization. */
+  accountChanged?: boolean;
 };
 
 /**
@@ -53,26 +72,70 @@ export default function CreateChallengeTicket({
   settlementPreview,
   stakeAmount,
   walletAddress,
+  maxAmount,
+  searchParams,
+  accountChanged = false,
 }: CreateChallengeTicketProps) {
   const t = useTranslations("create");
-  const stakeStr = Number.isFinite(stakeAmount) ? stakeAmount.toFixed(2) : "—";
+
+  // Resolve search params from prop or, in the browser, from the URL.
+  const [resolvedSearch, setResolvedSearch] = useState<string | undefined>(
+    searchParams,
+  );
+  useEffect(() => {
+    if (searchParams !== undefined) {
+      setResolvedSearch(searchParams);
+      return;
+    }
+    if (typeof window !== "undefined") {
+      setResolvedSearch(window.location.search);
+    }
+  }, [searchParams]);
+
+  const prefill = useMemo(() => {
+    if (!resolvedSearch) return null;
+    try {
+      const params = new URLSearchParams(
+        resolvedSearch.startsWith("?")
+          ? resolvedSearch.slice(1)
+          : resolvedSearch,
+      );
+      return parsePrefillParams(params, maxAmount);
+    } catch {
+      return null;
+    }
+  }, [resolvedSearch, maxAmount]);
+
+  const effectiveStake = prefill ? prefill.amount : stakeAmount;
+  const stakeStr = Number.isFinite(effectiveStake)
+    ? effectiveStake.toFixed(2)
+    : "—";
   const body = truncate(settlementPreview.trim(), 240);
   const authDisplay = formatWalletForTicket(walletAddress);
   const showQuoted = body.length > 0;
 
   return (
-    <div className="relative overflow-hidden rounded-2xl border border-pv-ink/[0.12] bg-pv-surface/70 shadow-glow-emerald backdrop-blur-[20px] transition-all duration-200">
+    <div className={CREATE_TICKET_SHELL_CLASS}>
+      {accountChanged ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className="border-b border-pv-amber/40 bg-pv-amber/10 px-4 py-2 text-xs text-pv-text"
+        >
+          Account changed — review and re-authorize before submitting.
+        </div>
+      ) : null}
       {/* Watermark — transitions from UNSIGNED to SIGNED based on wallet */}
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none overflow-hidden">
-        <span className="font-display text-[72px] sm:text-[96px] font-bold uppercase tracking-[0.15em] text-pv-ink/[0.02] rotate-[-12deg]">
-          {walletAddress ? "SIGNED" : "UNSIGNED"}
+        <span className={CREATE_TICKET_WATERMARK_CLASS}>
+          {accountChanged ? "UNSIGNED" : walletAddress ? "SIGNED" : "UNSIGNED"}
         </span>
       </div>
       <div
         className="absolute left-0 top-0 h-1 w-full bg-pv-emerald"
         aria-hidden
       />
-      <div className="space-y-8 p-6 sm:p-8">
+      <div className={CREATE_TICKET_BODY_CLASS}>
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h2 className="font-display text-lg font-bold tracking-tighter text-pv-text sm:text-xl">
@@ -91,12 +154,12 @@ export default function CreateChallengeTicket({
         </div>
 
         <div className="space-y-6">
-          <div className="grid grid-cols-2 gap-x-3 gap-y-4">
+          <div className={CREATE_TICKET_META_GRID_CLASS}>
             <div>
               <div className="mb-1 block text-[10px] font-bold uppercase tracking-[0.14em] text-pv-muted">
                 {t("marketType")}
               </div>
-              <span className="text-sm font-semibold text-pv-text">
+              <span className="break-words text-sm font-semibold text-pv-text">
                 {marketTypeLabel}
               </span>
             </div>
@@ -124,13 +187,23 @@ export default function CreateChallengeTicket({
                 {visibilityLabel}
               </span>
             </div>
+            {prefill ? (
+              <div>
+                <div className="mb-1 block text-[10px] font-bold uppercase tracking-[0.14em] text-pv-muted">
+                  {t("ticketSideLabel")}
+                </div>
+                <span className="text-sm font-semibold uppercase text-pv-emerald">
+                  {prefill.side}
+                </span>
+              </div>
+            ) : null}
           </div>
 
           <div className="space-y-2 border-t border-pv-ink/[0.08] pt-6">
             <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-pv-muted">
               {t("settlementRule")}
             </div>
-            <p className="text-xs italic leading-relaxed text-pv-text/85">
+            <p className="text-xs italic break-words leading-relaxed text-pv-text/85">
               {showQuoted ? (
                 <>
                   <span className="text-pv-muted/70" aria-hidden>

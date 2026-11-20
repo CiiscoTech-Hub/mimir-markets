@@ -11,6 +11,7 @@ import {
   acceptVS,
   cancelVS,
   didUserChallengeVS,
+  getClaimFees,
   getRivalryChain,
   getVS,
   getVSChallengerCount,
@@ -31,13 +32,20 @@ import {
 } from "@/lib/contract";
 import { getExplorerTxUrl, waitForTransaction } from "@/lib/stellar";
 import { buildSeriesView } from "@/lib/series-view";
-import { getPendingVS } from "@/lib/pending-vs";
 import { openPeepsAvatar } from "@/lib/avatars";
+import { useVsDetail } from "@/hooks/useVsDetail";
+import CacheFreshnessControls from "@/components/CacheFreshnessControls";
 import { formatUsdc } from "@/lib/money";
 import {
   availableCreatorLiquidityUnits,
+  feeStateFromClaimFees,
   maxFixedOddsStakeUnits,
-  previewChallengerPayout,
+  PENDING_FEE_STATE,
+  poolCreatorPayoutUnits,
+  previewChallengerPayoutSafe,
+  principalSafePayout,
+  toPrincipalSafePreview,
+  type PayoutFeeState,
 } from "@/lib/payout";
 import { unitsToUsdc, usdcToUnits } from "@/lib/usdc";
 import { toCanonicalMode } from "@/lib/market-modes";
@@ -48,6 +56,7 @@ import { idempotencyKey } from "@/lib/analytics/events";
 import { stakeBucket } from "@/lib/analytics/useMarketAnalytics";
 import ReasoningFeed from "@/components/vs/ReasoningFeed";
 import { acquireTxLock } from "@/lib/tx-lock";
+import { evaluateUsdcTrustlineGate } from "@/lib/usdcTrustlineGate";
 import {
   MIN_STAKE,
   ZERO_ADDRESS,
@@ -56,8 +65,6 @@ import {
 } from "@/lib/constants";
 import {
   MOCK_CREATED_VS_ID,
-  mergeMockSnapshotIntoVs,
-  readCreateMockSnapshot,
 } from "@/lib/mockVsCreate";
 import { SAMPLE_VS } from "@/lib/sampleVs";
 import { useCountdown } from "@/lib/hooks";
@@ -81,7 +88,10 @@ import ResolutionTerminal from "@/components/ResolutionTerminal";
 import { ShareMarket } from "@/components/vs/ShareMarket";
 import { ProfileLink } from "@/components/ui/AddressChip";
 import ClaimPayoutCard from "@/components/vs/ClaimPayoutCard";
-import { UsdcTrustlineGate } from "@/components/wallet/UsdcTrustlineGate";
+import {
+  UsdcTrustlineGate,
+  useUsdcTrustline,
+} from "@/components/wallet/UsdcTrustlineGate";
 import VsXmtpPanel from "@/components/xmtp/VsXmtpPanel";
 import CouncilVoteWidget from "@/components/council/CouncilVoteWidget";
 import Stage from "@/components/Stage";
@@ -105,22 +115,27 @@ import {
   SlidersHorizontal,
   Users,
 } from "lucide-react";
+import { ProgressBar } from "@/components/vs/detail/ProgressBar";
+import { VsChallengersCard } from "@/components/vs/detail/VsChallengersCard";
+import {
+  buildDesignPreviewVs,
+  buildDesignPreviewRematchChain,
+  formatChallengers,
+  txToastOptions,
+  VERDICT_OVERLAY_MS,
+  RESOLVE_PHASE_MS,
+  RESOLVE_ANIM_TOTAL_MS,
+} from "@/lib/vs/detail-preview";
 
 /**
- * Direcciones ficticias para previsualizar fases accepted / verifying / proven en
- * VS de muestra (sin blockchain).
+ * Design-preview fixtures live in `lib/design-preview/vs.ts` and are loaded
+ * lazily so they never ship in the normal page bundle.
  *
- * Real, checksum-valid `G…` strkeys rather than the repeated-nibble EVM addresses
- * they replace: the header, the challenger roster and the explorer links all run
- * these through `isAccountAddress` / `getExplorerAddressUrl`, so a stand-in that
- * is not a valid strkey renders the sample market as broken.
+ * To enable the preview, open a sample market (negative id, e.g. `/vs/-1`) and
+ * use the lifecycle controls rendered by the sample-mode card. The builders are
+ * only imported when `isSampleVS` is true.
  */
-const DESIGN_PREVIEW_OPPONENT =
-  "GARCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCFRVX";
-const DESIGN_PREVIEW_CHALLENGER_2 =
-  "GAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTHCM6";
-const DESIGN_PREVIEW_CHALLENGER_3 =
-  "GBCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIZCA";
+type DesignPreviewModule = typeof import("@/lib/design-preview/vs");
 
 /** Misma silueta que la píldora «{addr} challenges you» (fucsia, pill redondeada). */
 const DUEL_STATUS_FUCHSIA_PILL_CLASS =
@@ -131,619 +146,6 @@ const RIVALRY_ITEM_BASE_CLASS =
 const RIVALRY_ITEM_ACTIVE_CLASS =
   "border-pv-emerald/[0.35] bg-pv-emerald/[0.08] hover:border-pv-emerald/[0.45] hover:bg-pv-emerald/[0.12]";
 
-/** Demo ticket `-4` (1v1): preview alineado con XMTP y métrica SLOTS 1/1. */
-function isDesignPreviewOneVsOneBase(base: VSData): boolean {
-  return (
-    base.id === MOCK_CREATED_VS_ID && getVSConfiguredMaxChallengers(base) === 1
-  );
-}
-
-function buildDesignPreviewVs(
-  base: VSData,
-  step: number,
-  resolutionSummary: string,
-  resolvedOutcome: "creator" | "challengers" = "creator",
-): VSData {
-  const oneV1 = isDesignPreviewOneVsOneBase(base);
-
-  if (step <= 0) {
-    return {
-      ...base,
-      state: "open",
-      opponent: ZERO_ADDRESS,
-      winner: ZERO_ADDRESS,
-      resolution_summary: "",
-      winner_side: undefined,
-      challenger_count: 0,
-      challengers: undefined,
-      challenger_addresses: undefined,
-    };
-  }
-  if (step <= 2) {
-    const pot = getVSTotalPot({
-      ...base,
-      opponent: DESIGN_PREVIEW_OPPONENT,
-      state: "accepted",
-    });
-    if (oneV1) {
-      return {
-        ...base,
-        state: "accepted",
-        opponent: DESIGN_PREVIEW_OPPONENT,
-        winner: ZERO_ADDRESS,
-        resolution_summary: "",
-        winner_side: undefined,
-        challenger_count: 1,
-        challenger_addresses: [DESIGN_PREVIEW_OPPONENT],
-        challengers: [
-          {
-            address: DESIGN_PREVIEW_OPPONENT,
-            stake: base.stake_amount,
-            potential_payout: pot,
-          },
-        ],
-      };
-    }
-    return {
-      ...base,
-      state: "accepted",
-      opponent: DESIGN_PREVIEW_OPPONENT,
-      winner: ZERO_ADDRESS,
-      resolution_summary: "",
-      winner_side: undefined,
-      challenger_count: 3,
-      challenger_addresses: [DESIGN_PREVIEW_OPPONENT, DESIGN_PREVIEW_CHALLENGER_2, DESIGN_PREVIEW_CHALLENGER_3],
-      challengers: [
-        {
-          address: DESIGN_PREVIEW_OPPONENT,
-          stake: base.stake_amount,
-          potential_payout: pot,
-        },
-        {
-          address: DESIGN_PREVIEW_CHALLENGER_2,
-          stake: base.stake_amount,
-          potential_payout: pot,
-        },
-        {
-          address: DESIGN_PREVIEW_CHALLENGER_3,
-          stake: base.stake_amount,
-          potential_payout: pot,
-        },
-      ],
-    };
-  }
-  if (step === 3) {
-    const resolvedPot = getVSTotalPot({
-      ...base,
-      opponent: DESIGN_PREVIEW_OPPONENT,
-      state: "resolved",
-    });
-
-    if (resolvedOutcome === "creator") {
-      return {
-        ...base,
-        state: "resolved",
-        opponent: DESIGN_PREVIEW_OPPONENT,
-        winner: base.creator,
-        winner_side: "creator",
-        resolution_summary: resolutionSummary,
-        challenger_count: 1,
-        challenger_addresses: [DESIGN_PREVIEW_OPPONENT],
-        challengers: [
-          {
-            address: DESIGN_PREVIEW_OPPONENT,
-            stake: base.stake_amount,
-            potential_payout: resolvedPot,
-          },
-          {
-            address: DESIGN_PREVIEW_CHALLENGER_2,
-            stake: base.stake_amount,
-            potential_payout: resolvedPot,
-          },
-          {
-            address: DESIGN_PREVIEW_CHALLENGER_3,
-            stake: base.stake_amount,
-            potential_payout: resolvedPot,
-          },
-        ],
-      };
-    }
-
-    return {
-      ...base,
-      state: "resolved",
-      opponent: DESIGN_PREVIEW_OPPONENT,
-      winner: DESIGN_PREVIEW_OPPONENT,
-      winner_side: "challengers",
-      resolution_summary: resolutionSummary,
-      challenger_count: 1,
-      challenger_addresses: [DESIGN_PREVIEW_OPPONENT],
-      challengers: [
-        {
-          address: DESIGN_PREVIEW_OPPONENT,
-          stake: base.stake_amount,
-          potential_payout: resolvedPot,
-        },
-      ],
-    };
-  }
-
-  // step >= 4 => CANCELLED (solo para modo demo/testing)
-  const cancelledPot = getVSTotalPot({
-    ...base,
-    opponent: DESIGN_PREVIEW_OPPONENT,
-    state: "cancelled",
-  });
-
-  if (oneV1) {
-    return {
-      ...base,
-      state: "cancelled",
-      opponent: DESIGN_PREVIEW_OPPONENT,
-      winner: ZERO_ADDRESS,
-      winner_side: undefined,
-      resolution_summary: "",
-      challenger_count: 1,
-      challenger_addresses: [DESIGN_PREVIEW_OPPONENT],
-      challengers: [
-        {
-          address: DESIGN_PREVIEW_OPPONENT,
-          stake: base.stake_amount,
-          potential_payout: cancelledPot,
-        },
-      ],
-    };
-  }
-
-  return {
-    ...base,
-    state: "cancelled",
-    opponent: DESIGN_PREVIEW_OPPONENT,
-    winner: ZERO_ADDRESS,
-    winner_side: undefined,
-    resolution_summary: "",
-    challenger_count: 1,
-    challenger_addresses: [DESIGN_PREVIEW_OPPONENT],
-    challengers: [
-      {
-        address: DESIGN_PREVIEW_OPPONENT,
-        stake: base.stake_amount,
-        potential_payout: cancelledPot,
-      },
-    ],
-  };
-}
-
-function buildDesignPreviewRematchChain(
-  base: VSData,
-  firstRoundOutcome: "creator" | "challengers",
-  resolutionSummary: string,
-): VSData[] {
-  // Dos rondas mock para que se vea "Rematch" en el card sin depender de on-chain.
-  const isGpt5Vs =
-    base.question.startsWith("GPT-5 Announced by OpenAI before ");
-
-  const round1BaseQuestion = isGpt5Vs
-    ? base.question.replace(/before\s+[A-Za-z]+\b.*/i, "before February")
-    : base.question.includes("March")
-      ? base.question.replace("March", "January")
-      : base.question;
-
-  const round2BaseQuestion = isGpt5Vs
-    ? base.question.replace(/before\s+[A-Za-z]+\b.*/i, "before June")
-    : base.question;
-
-  const round1Base: VSData = {
-    ...base,
-    id: base.id - 100,
-    question: round1BaseQuestion,
-    creator_position: isGpt5Vs
-      ? "OpenAI announces GPT-5 before February"
-      : base.creator_position,
-    opponent_position: isGpt5Vs
-      ? "No official announcement before February"
-      : base.opponent_position,
-    resolution_summary: resolutionSummary,
-  };
-
-  const round2Base: VSData = {
-    ...base,
-    id: base.id - 101,
-    question: round2BaseQuestion,
-    creator_position: isGpt5Vs ? "OpenAI announces GPT-5 before June" : base.creator_position,
-    opponent_position: isGpt5Vs ? "No official announcement before June" : base.opponent_position,
-    resolution_summary: resolutionSummary,
-  };
-
-  const round2Outcome: "creator" | "challengers" =
-    firstRoundOutcome === "creator" ? "challengers" : "creator";
-
-  // ROUND 3: no llega a PROVEN todavía (se mantiene en "accepted").
-  const round3Base: VSData = {
-    ...base,
-    id: base.id - 102,
-    question: "BTC Price will break $100k before August 31",
-    resolution_summary: resolutionSummary,
-  };
-
-  return [
-    buildDesignPreviewVs(round1Base, 3, resolutionSummary, firstRoundOutcome),
-    buildDesignPreviewVs(round2Base, 3, resolutionSummary, round2Outcome),
-    buildDesignPreviewVs(round3Base, 2, resolutionSummary, "creator"),
-  ];
-}
-
-type ProgressBarProps = {
-  canonicalState: string;
-  visualStepIndex?: number | null;
-  interactive?: boolean;
-  onStepSelect?: (index: number) => void;
-};
-
-function ProgressBar({
-  canonicalState,
-  visualStepIndex = null,
-  interactive = false,
-  onStepSelect,
-}: ProgressBarProps) {
-  const t = useTranslations("vsDetail");
-  const steps = [
-    t("progressCreated"),
-    t("progressAccepted"),
-    t("progressVerifying"),
-    t("progressProven"),
-  ];
-  const total = steps.length;
-
-  const stepIndexFromState =
-    canonicalState === "open"
-      ? 0
-      : canonicalState === "accepted"
-        ? 1
-        : canonicalState === "resolved"
-          ? 3
-          : canonicalState === "cancelled"
-            ? -1
-            : 0;
-
-  const stepIndex =
-    typeof visualStepIndex === "number" && visualStepIndex >= 0 && visualStepIndex <= 3
-      ? visualStepIndex
-      : stepIndexFromState;
-
-  if (canonicalState === "cancelled" || stepIndexFromState === -1) {
-    return null;
-  }
-
-  const isResolved = stepIndex >= 3;
-  const progressPercent = isResolved ? 100 : ((stepIndex + 1) / total) * 100;
-  const phaseCurrent = isResolved ? total : stepIndex + 1;
-
-  const cellClass = (isCurrent: boolean, isDone: boolean) =>
-    `flex h-full min-h-[4.5rem] w-full flex-col gap-2 rounded-lg border px-3 py-3 text-left transition-all duration-300 sm:min-h-0 sm:py-3.5 ${
-      interactive ? "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pv-emerald/35 " : ""
-    }${
-      isCurrent
-        ? "border-pv-emerald/40 bg-pv-emerald/[0.07] shadow-glow-emerald"
-        : isDone
-          ? "border-pv-emerald/20 bg-pv-emerald/[0.04]"
-          : "border-pv-ink/[0.06] bg-pv-bg/40"
-    } ${interactive && !isCurrent ? "hover:border-pv-ink/[0.1]" : ""}`;
-
-  return (
-    <nav
-      className="mb-8 sm:mb-10"
-      aria-label={t("progressAriaLabel")}
-    >
-      <div className="rounded-2xl border border-pv-ink/[0.08] bg-pv-surface/80 p-5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] sm:p-6">
-        {/* Expanding phase bar — active phase takes proportional space */}
-        <div className="flex h-1.5 w-full gap-0.5 overflow-hidden rounded-full" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progressPercent)} aria-valuetext={t("progressStepFraction", { current: phaseCurrent, total })}>
-          {steps.map((_, i) => {
-            const isDone = isResolved || i < stepIndex;
-            const isCurrent = !isResolved && i === stepIndex;
-            const shouldFill = isDone || isCurrent;
-            return (
-              <motion.div
-                key={i}
-                className="relative flex-1 h-full overflow-hidden rounded-full bg-pv-ink/[0.06]"
-                initial={false}
-                style={{ transformOrigin: "left center" }}
-              >
-                <motion.div
-                  className={`absolute inset-0 rounded-full ${
-                    isDone ? "bg-pv-emerald" : isCurrent ? "bg-pv-emerald animate-phase-glow" : ""
-                  }`}
-                  initial={false}
-                  style={{ transformOrigin: "left center" }}
-                  animate={{
-                    scaleX: shouldFill ? 1 : 0,
-                    opacity: shouldFill ? 1 : 0,
-                  }}
-                  transition={{
-                    duration: 0.5,
-                    ease: [0.22, 1, 0.36, 1],
-                  }}
-                />
-              </motion.div>
-            );
-          })}
-        </div>
-
-        <ol className="mt-5 grid grid-cols-2 gap-3 sm:mt-6 sm:grid-cols-4 sm:gap-4">
-          {steps.map((step, index) => {
-            const isDone = isResolved || index < stepIndex;
-            const isCurrent = !isResolved && index === stepIndex;
-            const isProvenStep = index === 3;
-            const stepNum = String(index + 1).padStart(2, "0");
-            const stepCode = `STEP ${stepNum}`;
-            const label = `${stepCode}: ${step}`;
-
-            const inner = (
-              <>
-                <span className="sr-only">{label}</span>
-                <span className="font-mono text-[11px] font-medium tabular-nums tracking-[0.12em] text-pv-muted/70 sm:text-[12px]">
-                  {stepNum}
-                </span>
-                <span
-                  aria-current={isCurrent ? "step" : undefined}
-                  className={`flex items-start gap-2 font-display ${
-                    isProvenStep
-                      ? "text-[9px] sm:text-[10px]"
-                      : "text-[10px] sm:text-[11px]"
-                  } font-bold uppercase leading-snug tracking-[0.14em] sm:tracking-[0.16em] ${
-                    isCurrent
-                      ? "text-pv-emerald"
-                      : isDone
-                        ? "text-pv-text/90"
-                        : "text-pv-muted/45"
-                  }`}
-                >
-                  <span>{step}</span>
-                  {isDone ? (
-                    <Check
-                      className="mt-0.5 h-3.5 w-3.5 shrink-0 text-pv-emerald"
-                      strokeWidth={2.5}
-                      aria-hidden
-                    />
-                  ) : null}
-                </span>
-              </>
-            );
-
-            return (
-              <li key={stepCode} className="min-w-0 list-none">
-                {interactive && onStepSelect ? (
-                  <button
-                    type="button"
-                    className={cellClass(isCurrent, isDone)}
-                    aria-label={label}
-                    aria-pressed={isCurrent}
-                    onClick={() => onStepSelect(index)}
-                  >
-                    {inner}
-                  </button>
-                ) : (
-                  <div className={cellClass(isCurrent, isDone)}>{inner}</div>
-                )}
-              </li>
-            );
-          })}
-        </ol>
-      </div>
-    </nav>
-  );
-}
-
-function formatChallengers(vs: VSData): ClaimChallenger[] {
-  if (vs.challengers && vs.challengers.length > 0) {
-    return vs.challengers;
-  }
-
-  return (vs.challenger_addresses ?? []).map((entry) => ({
-    address: entry,
-    stake: vs.stake_amount,
-    potential_payout:
-      vs.odds_mode === "fixed" && (vs.challenger_payout_bps ?? 0) > 0
-        ? Math.floor((vs.stake_amount * (vs.challenger_payout_bps ?? 0)) / 10000)
-        : getVSTotalPot(vs),
-  }));
-}
-
-/**
- * Three, and no scroll container.
- *
- * The panel used to paginate at four AND scroll inside a fixed height, so a full
- * page overflowed into a scrollbar in a narrow column and the wallet rows wrapped
- * to one word per line. A page that fits is the point of paginating.
- */
-const CHALLENGERS_PAGE_SIZE = 3;
-
-/** Toast options linking to the tx hash, when the write returned one. */
-function txToastOptions(result: {
-  explorerTxHash?: string | null;
-  txHash?: string | null;
-}): { description: string } | undefined {
-  const hash = result.explorerTxHash || result.txHash;
-  return hash
-    ? { description: `Tx: ${hash.slice(0, 10)}...${hash.slice(-8)}` }
-    : undefined;
-}
-
-// On-chain refresh cadence; the loading spinner gives up after
-// MAX_FETCH_ATTEMPTS * VS_POLL_INTERVAL_MS (~2 min).
-const VS_POLL_INTERVAL_MS = 10_000;
-const MAX_FETCH_ATTEMPTS = 12;
-// How long the verdict overlay / seal stamp stays on screen.
-const VERDICT_OVERLAY_MS = 4000;
-// Resolution terminal types line by line; phases advance on this cadence and
-// the overlay stays up for the full animation even if the tx confirms sooner.
-const RESOLVE_PHASE_MS = [2600, 4600, 6500, 8400] as const;
-const RESOLVE_ANIM_TOTAL_MS = 9600;
-
-function VsChallengersCard({
-  challengers,
-  counterPosition,
-  address,
-  challengerCount,
-  maxChallengers,
-  showLoadMore = false,
-  className = "border border-pv-ink/[0.12] !rounded-2xl",
-}: {
-  challengers: ClaimChallenger[];
-  counterPosition: string;
-  address: string | null | undefined;
-  challengerCount: number;
-  maxChallengers: number;
-  showLoadMore?: boolean;
-  className?: string;
-}) {
-  const t = useTranslations("vsDetail");
-  const [page, setPage] = useState(0);
-
-  useEffect(() => {
-    setPage(0);
-  }, [showLoadMore, challengers.length]);
-
-  const pageCount = Math.max(1, Math.ceil(challengers.length / CHALLENGERS_PAGE_SIZE));
-  const normalizedPage = Math.min(page, pageCount - 1);
-  const visibleChallengers = challengers.slice(
-    normalizedPage * CHALLENGERS_PAGE_SIZE,
-    normalizedPage * CHALLENGERS_PAGE_SIZE + CHALLENGERS_PAGE_SIZE,
-  );
-  const hasPagination = challengers.length > CHALLENGERS_PAGE_SIZE;
-
-  return (
-    <GlassCard glass glow="none" noPad className={className}>
-      <div className="space-y-4 p-5 sm:p-6">
-        <div>
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0 text-[11px] font-bold uppercase tracking-[0.18em] text-pv-emerald/85">
-              {t("challengers")}
-            </div>
-            <span
-              className="inline-flex shrink-0 items-center rounded-full border border-pv-fuch/35 bg-pv-fuch/[0.12] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-pv-fuch sm:tracking-[0.16em]"
-              title={t("slotsFilled", {
-                count: challengerCount,
-                total: maxChallengers,
-              })}
-            >
-              {t("slotsFilled", {
-                count: challengerCount,
-                total: maxChallengers,
-              })}
-            </span>
-          </div>
-          <p className="mt-2 text-xs leading-relaxed text-pv-muted">
-            {t("challengersHint")}
-          </p>
-        </div>
-
-        {challengers.length === 0 ? (
-          <div
-            className="rounded-xl border border-dashed border-pv-ink/[0.14] bg-pv-bg/30 px-4 py-9 text-center sm:py-11"
-            role="status"
-          >
-            <Users
-              className="mx-auto mb-3 size-10 text-pv-fuch/35 sm:size-11"
-              strokeWidth={1.25}
-              aria-hidden
-            />
-            <p className="text-sm leading-relaxed text-pv-muted">
-              {t("noChallengersYet")}
-            </p>
-          </div>
-        ) : (
-          <div className="rounded-xl border border-pv-ink/[0.1] bg-pv-bg/25 p-2.5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)] sm:p-3.5">
-            <ul className="space-y-2 sm:space-y-2.5" role="list">
-              {visibleChallengers.map((challenger, index) => (
-                <li key={`${challenger.address}-${normalizedPage}-${index}`}>
-                  <div className="rounded-lg border border-pv-ink/[0.08] bg-gradient-to-br from-pv-fuch/[0.04] via-transparent to-transparent p-2.5 transition-[border-color,background-color] duration-200 hover:border-pv-ink/[0.14] sm:p-3">
-                    <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-1.5 sm:gap-2.5 md:gap-3">
-                      <div className="relative size-9 shrink-0 sm:size-10" aria-hidden>
-                        <div className="flex h-full w-full items-center justify-center overflow-hidden rounded-full border border-pv-fuch/[0.32] bg-pv-surface2 shadow-[inset_0_0_18px_rgba(255,255,255,0.03)]">
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img
-                            src={openPeepsAvatar(`challenger-${challenger.address}`)}
-                            alt=""
-                            className="h-full w-full object-cover object-top opacity-95"
-                          />
-                        </div>
-                        <span className="absolute -bottom-1 -right-1 z-10 flex h-4 min-w-4 items-center justify-center rounded-full border border-pv-bg bg-pv-fuch px-1 font-mono text-[8px] font-bold tabular-nums leading-none text-pv-bg shadow-[0_2px_8px_rgba(0,0,0,0.35)]">
-                          {normalizedPage * CHALLENGERS_PAGE_SIZE + index + 1}
-                        </span>
-                      </div>
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
-                          <ProfileLink
-                            address={challenger.address}
-                            className="break-words font-semibold text-[12px] leading-tight text-pv-text sm:text-[13px]"
-                          />
-                          {/* Exact comparison: strkeys are case-sensitive base32,
-                              so the lowercased pair this replaced would have
-                              stopped matching the connected wallet entirely. */}
-                          {address && challenger.address.trim() === address.trim() && (
-                            <span className="text-[10px] font-bold uppercase tracking-[0.1em] text-pv-emerald">
-                              {t("you")}
-                            </span>
-                          )}
-                        </div>
-                        {counterPosition.trim() ? (
-                          <p className="mt-1 text-[11px] leading-snug text-pv-muted sm:text-[12px]">
-                            {counterPosition}
-                          </p>
-                        ) : null}
-                      </div>
-                      <div className="flex min-w-0 flex-col gap-1 justify-self-end sm:justify-self-start">
-                        <div
-                          className="flex min-h-7 min-w-[4.5rem] items-center justify-center rounded-md border border-pv-ink/[0.1] bg-pv-bg/55 px-2 py-1 font-mono text-[9px] font-bold tabular-nums leading-none text-pv-fuch sm:min-h-8 sm:min-w-[5rem] sm:text-[10px]"
-                          title={t("challengerStake")}
-                        >
-                          {formatUsdc(challenger.stake)}
-                        </div>
-                        <div
-                          className="flex min-h-7 min-w-[4.5rem] items-center justify-center rounded-md border border-pv-emerald/[0.18] bg-pv-emerald/[0.08] px-2 py-1 font-mono text-[9px] font-bold tabular-nums leading-none text-pv-emerald sm:min-h-8 sm:min-w-[5rem] sm:text-[10px]"
-                          title={t("potentialPayout")}
-                        >
-                          {formatUsdc(challenger.potential_payout)}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </li>
-              ))}
-            </ul>
-            {hasPagination ? (
-              <div className="flex items-center justify-between gap-3 pt-3">
-                <button
-                  type="button"
-                  aria-label="Previous challengers"
-                  disabled={normalizedPage === 0}
-                  onClick={() => setPage((current) => Math.max(0, current - 1))}
-                  className="flex h-9 w-9 items-center justify-center rounded-lg border border-pv-ink/[0.08] bg-pv-ink/[0.02] text-sm font-bold text-pv-muted transition-[background-color,border-color,color] hover:border-pv-ink/[0.14] hover:bg-pv-ink/[0.04] hover:text-pv-text disabled:cursor-not-allowed disabled:opacity-35"
-                >
-                  {"<"}
-                </button>
-                <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-pv-muted">
-                  {normalizedPage + 1}/{pageCount}
-                </span>
-                <button
-                  type="button"
-                  aria-label="Next challengers"
-                  disabled={normalizedPage >= pageCount - 1}
-                  onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))}
-                  className="flex h-9 w-9 items-center justify-center rounded-lg border border-pv-ink/[0.08] bg-pv-ink/[0.02] text-sm font-bold text-pv-muted transition-[background-color,border-color,color] hover:border-pv-ink/[0.14] hover:bg-pv-ink/[0.04] hover:text-pv-text disabled:cursor-not-allowed disabled:opacity-35"
-                >
-                  {">"}
-                </button>
-              </div>
-            ) : null}
-          </div>
-        )}
-      </div>
-    </GlassCard>
-  );
-}
-
 export default function VSDetailPage() {
   const params = useParams();
   const searchParams = useSearchParams();
@@ -751,32 +153,56 @@ export default function VSDetailPage() {
   const isSampleVS = vsId < 0 && !!SAMPLE_VS[vsId];
   const inviteFromUrl = searchParams.get("invite")?.trim() ?? "";
   const { address, isConnected, connect, signer } = useWallet();
+  const trustline = useUsdcTrustline();
   const t = useTranslations("vsDetail");
+  const tWallet = useTranslations("wallet");
   const tc = useTranslations("common");
   const tStamp = useTranslations("stamp");
   const tBadges = useTranslations("badges");
 
-  const [vs, setVS] = useState<VSData | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [fetchAttempts, setFetchAttempts] = useState(0);
+  const [storedInviteKey, setStoredInviteKey] = useState("");
+
+  const inviteKey = inviteFromUrl || storedInviteKey;
+
+  // ── useVsDetail: generation-guarded polling, freshness, user-context ────────
+  const {
+    phase: vsPhase,
+    vs,
+    cache: vsFreshness,
+    fetchAttempts,
+    refreshing,
+    challengeStake,
+    setChallengeStake,
+    resetChallengeStake,
+    refresh: refreshVs,
+  } = useVsDetail({ vsId, address, inviteKey, isSampleVS });
+
+  /** Convenience: true during initial load (skeleton shown). */
+  const loading = vsPhase === "loading";
+
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [resolvePhase, setResolvePhase] = useState(-1);
   const [showVerdict, setShowVerdict] = useState(false);
-  const [challengeStake, setChallengeStake] = useState("");
+  /**
+   * The claim's snapshotted fee terms, which turn the gross preview into the
+   * number the contract will actually pay. Read once per claim: the snapshot is
+   * immutable after create, so it cannot go stale while the page is open.
+   */
+  const [feeState, setFeeState] = useState<PayoutFeeState>(PENDING_FEE_STATE);
   const [rivalryChain, setRivalryChain] = useState<VSData[]>([]);
   const [rivalryLoading, setRivalryLoading] = useState(false);
   // Evita parpadeos: si cambiamos de `vs.id` o aún no terminó el fetch,
   // mostramos "loading" en vez de "empty" con datos viejos/vacíos.
   const [rivalryLoadedForVsId, setRivalryLoadedForVsId] = useState<number | null>(null);
   const [isRivalryExpanded, setIsRivalryExpanded] = useState(false);
-  const [storedInviteKey, setStoredInviteKey] = useState("");
   const [marketTermsOpen, setMarketTermsOpen] = useState(false);
   const marketTermsHeadingId = useId();
   const marketTermsPanelId = useId();
   /** Solo VS de muestra (ids negativos): índice 0–4 para previsualizar diseño sin blockchain. */
   const [designLifecycleStep, setDesignLifecycleStep] = useState<number | null>(null);
   const [designResolvedOutcome, setDesignResolvedOutcome] = useState<"creator" | "challengers">("creator");
+  const [designPreview, setDesignPreview] = useState<DesignPreviewModule | null>(null);
   /** Tracks whether a resolve tx was fired so we can reveal the verdict once the state arrives. */
   const pendingResolveRef = useRef(false);
   const attemptedFinalizeResolveTxRef = useRef<string | null>(null);
@@ -784,8 +210,6 @@ export default function VSDetailPage() {
   const [, setHasAttemptedResolve] = useState(false);
 
   const countdown = useCountdown(vs?.deadline || 0);
-
-  const inviteKey = inviteFromUrl || storedInviteKey;
 
   useEffect(() => {
     setDesignLifecycleStep(null);
@@ -796,18 +220,37 @@ export default function VSDetailPage() {
     setHasAttemptedResolve(false);
   }, [vsId]);
 
+  // Load the design-preview builders only when a sample market is open, so the
+  // fixtures stay out of the production chunk for every real market.
+  useEffect(() => {
+    if (!isSampleVS) {
+      setDesignPreview(null);
+      return;
+    }
+    let cancelled = false;
+    import("@/lib/design-preview/vs").then((mod) => {
+      if (!cancelled) setDesignPreview(mod);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isSampleVS]);
+
   const displayVs = useMemo(() => {
     if (!vs) return null;
     if (!isSampleVS || designLifecycleStep === null) {
       return vs;
     }
-    return buildDesignPreviewVs(
+    if (!designPreview) {
+      return vs;
+    }
+    return designPreview.buildDesignPreviewVs(
       vs,
       designLifecycleStep,
       t("designPreviewResolutionSummary"),
       designResolvedOutcome,
     );
-  }, [vs, isSampleVS, designLifecycleStep, t, designResolvedOutcome]);
+  }, [vs, isSampleVS, designLifecycleStep, t, designResolvedOutcome, designPreview]);
 
   useEffect(() => {
     if (isSampleVS) {
@@ -823,54 +266,39 @@ export default function VSDetailPage() {
     setStoredInviteKey(getStoredPrivateInviteKey(vsId));
   }, [inviteFromUrl, isSampleVS, vsId]);
 
-  const fetchVS = useCallback(async () => {
-    if (isSampleVS) {
-      let data = SAMPLE_VS[vsId];
-      if (vsId === MOCK_CREATED_VS_ID) {
-        const snap = readCreateMockSnapshot();
-        if (snap) {
-          data = mergeMockSnapshotIntoVs(data, snap);
-        }
-      }
-      setVS(data);
-      setLoading(false);
-      return;
-    }
-
-    const data = await getVS(vsId, {
-      inviteKey,
-      viewerAddress: address ?? undefined,
-    });
-    if (data) {
-      setVS(data);
-      setLoading(false);
-      setFetchAttempts(0);
-    } else {
-      // Show optimistic data from localStorage while consensus is pending
-      const pending = getPendingVS(vsId);
-      if (pending) {
-        setVS(pending);
-        setLoading(false);
-      }
-      // Keep polling — once on-chain data arrives it replaces the pending item.
-      // Give up on the loading spinner after ~2 min.
-      setFetchAttempts((prev) => {
-        const next = prev + 1;
-        if (next >= MAX_FETCH_ATTEMPTS) setLoading(false);
-        return next;
-      });
-    }
-  }, [address, inviteKey, isSampleVS, vsId]);
-
+  // Fee terms are a separate, optional read from the market itself. `loading`
+  // while it is in flight, `unavailable` when the read fails or no contract is
+  // configured, `invalid` when the answer is a snapshot the contract could not
+  // have written. The preview falls back to the gross in every one of those
+  // cases, and says so — it never guesses a fee.
   useEffect(() => {
-    fetchVS();
     if (isSampleVS) {
+      // A sample market is not a real claim, so there is no snapshot to read and
+      // inventing a fee schedule would be fiction.
+      setFeeState({ status: "unavailable" });
       return;
     }
+    let cancelled = false;
+    setFeeState(PENDING_FEE_STATE);
+    getClaimFees(vsId)
+      .then((terms) => {
+        if (!cancelled) setFeeState(feeStateFromClaimFees(terms));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn("[vsDetail] claim fee terms read failed", err);
+        setFeeState({ status: "unavailable" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isSampleVS, vsId]);
 
-    const intervalId = setInterval(fetchVS, VS_POLL_INTERVAL_MS);
-    return () => clearInterval(intervalId);
-  }, [fetchVS, isSampleVS]);
+  /**
+   * Alias kept for the resolve-tx watcher and ClaimPayoutCard so that existing
+   * call sites read naturally.  Delegates to the hook's `refresh`.
+   */
+  const fetchVS = useCallback(() => refreshVs(), [refreshVs]);
 
   useEffect(() => {
     if (!vs || vs.state !== "resolved" || !pendingResolveRef.current) {
@@ -925,16 +353,6 @@ export default function VSDetailPage() {
       cancelled = true;
     };
   }, [address, fetchVS, isSampleVS, pendingResolveTxHash, t]);
-
-  useEffect(() => {
-    setChallengeStake("");
-  }, [vsId]);
-
-  useEffect(() => {
-    if (vs && challengeStake === "") {
-      setChallengeStake(String(vs.stake_amount));
-    }
-  }, [challengeStake, vs]);
 
   useEffect(() => {
     // La rivalry chain puede ser costosa y además se recalcula en cada refresh del VS.
@@ -1020,9 +438,13 @@ export default function VSDetailPage() {
       return;
     }
 
+    if (!designPreview) {
+      return;
+    }
+
     setRivalryLoading(false);
     setRivalryChain(
-      buildDesignPreviewRematchChain(
+      designPreview.buildDesignPreviewRematchChain(
         vs,
         designResolvedOutcome,
         t("designPreviewResolutionSummary"),
@@ -1035,6 +457,7 @@ export default function VSDetailPage() {
     designLifecycleStep,
     designResolvedOutcome,
     t,
+    designPreview,
   ]);
 
   if (loading) {
@@ -1069,11 +492,23 @@ export default function VSDetailPage() {
   const isOpponent = didUserChallengeVS(display, address);
   const isPrivateVS = isVSPrivate(vs);
   const missingPrivateInvite = isPrivateVS && !inviteKey && !isCreator && !isOpponent;
+  // Disconnected visitors get the connect CTA, not the stake form. The payout
+  // preview inside that form is address-independent (see
+  // `previewChallengerPayoutSafe`), so it needs no disconnected fallback of its
+  // own — connection gates the form and the action, not the number.
   const canAccept =
     !isSampleVS &&
     !missingPrivateInvite &&
     isVSJoinable(vs, address) &&
     isConnected;
+  const acceptTrustlineGate = evaluateUsdcTrustlineGate({
+    action: "accept",
+    status: trustline.status,
+    loading: trustline.loading,
+    stale: trustline.stale,
+    isConnected,
+    hasSigner: Boolean(signer),
+  });
   const canCancel = !isSampleVS && vs.state === "open" && isCreator;
   const hasWinner = hasVSWinner(display);
   const creatorRequestedResolve = Boolean(display.creator_requested_resolve);
@@ -1154,23 +589,38 @@ export default function VSDetailPage() {
   });
 
   // Previewed in atomic USDC units by lib/payout.ts, so the number shown matches
-  // what the contract will actually transfer (integer truncation included).
+  // what the contract will actually transfer (integer truncation included), and
+  // split with the claim's snapshotted fees so it matches what will actually be
+  // paid. `feeAdjusted` is false while the fee terms are loading, unavailable or
+  // invalid — the panel then shows the gross and labels it, because the gross is
+  // the most the position can pay and never below the stake.
   const stakePreview = hasValidChallengeStake
-    ? previewChallengerPayout({
+    ? previewChallengerPayoutSafe({
         settlementMode: canonicalMode.settlementMode,
         stake: challengeStakeValue,
         creatorStake,
         challengerPoolBefore: challengerStake,
         challengerPayoutBps: display.challenger_payout_bps,
+        fees: feeState,
       })
     : null;
-  const challengePayoutPreview = stakePreview?.totalReturn ?? null;
-  const challengeProfitPreview = stakePreview?.netProfit ?? null;
-  const creatorPayoutPreview = hasValidChallengeStake
-    ? pool + challengeStakeValue
-    : pool;
   const isPoolPreview = canonicalMode.settlementMode === "pool";
   const totalChallengerStakeAfterJoin = challengerStake + (hasValidChallengeStake ? challengeStakeValue : 0);
+  // The creator's side is settled with the same snapshot, so the "if creator wins"
+  // figure is net too. Showing one leg gross and the other net would make the two
+  // tiles incomparable.
+  const creatorPayoutPreview = hasValidChallengeStake
+    ? toPrincipalSafePreview(
+        principalSafePayout({
+          gross: poolCreatorPayoutUnits({
+            creatorStakeUnits: usdcToUnits(creatorStake),
+            challengerPoolUnits: usdcToUnits(totalChallengerStakeAfterJoin),
+          }),
+          feeState,
+          outcome: "creator_wins",
+        }),
+      ).netPayout
+    : pool;
 
   // Fixed odds: capacity is bounded by the creator's UNRESERVED liquidity, not by
   // a slot count, and it shrinks as each challenger reserves their profit. Read
@@ -1239,6 +689,10 @@ export default function VSDetailPage() {
       toast.error(t("invalidChallengeStakeMin", { amount: MIN_STAKE }));
       return;
     }
+    if (!acceptTrustlineGate.allowed) {
+      toast.error(tWallet(acceptTrustlineGate.messageKey));
+      return;
+    }
 
     await withTxLock(async (wallet) => {
     flushSync(() => {
@@ -1251,12 +705,12 @@ export default function VSDetailPage() {
       });
 
       if (!liveVS) {
-        setVS(null);
+        void fetchVS();
         toast.error(t("notFound"));
         return;
       }
 
-      setVS(liveVS);
+      void fetchVS();
 
       if (!isVSJoinable(liveVS, address)) {
         toast.error(t("challengeUnavailable"));
@@ -1308,6 +762,7 @@ export default function VSDetailPage() {
             }),
         txToastOptions(result)
       );
+      resetChallengeStake();
       fetchVS();
     } catch (err: any) {
       track({
@@ -1435,10 +890,18 @@ export default function VSDetailPage() {
           stakePreview
             ? {
                 stake: challengeStakeValue,
-                totalReturn: stakePreview.totalReturn,
-                netProfit: stakePreview.netProfit,
-                upsideBps: stakePreview.upsideBps,
+                // Analytics deliberately keeps the GROSS formula output for the
+                // money fields. `stake_previewed` / `payout_preview_seen` have
+                // always meant "the pool/fixed-odds math for this stake", and
+                // re-pointing them at the fee-adjusted net would silently change
+                // every historical comparison. `feeAdjusted` records which figure
+                // the user actually saw, so the two are never conflated; a future
+                // schema version can carry both if a dashboard needs the net.
+                totalReturn: stakePreview.gross.totalReturn,
+                netProfit: stakePreview.gross.netProfit,
+                upsideBps: stakePreview.gross.upsideBps,
                 isLowUpside: stakePreview.isLowUpside,
+                feeAdjusted: stakePreview.feeAdjusted,
               }
             : null
         }
@@ -1529,6 +992,19 @@ export default function VSDetailPage() {
                 ) : null}
               </div>
             )}
+          </AnimatedItem>
+        )}
+
+        {/* Freshness pill + manual refresh — only for real on-chain markets, not sample previews */}
+        {!isSampleVS && (vsFreshness || refreshing) && (
+          <AnimatedItem>
+            <div className="mb-6 sm:mb-8">
+              <CacheFreshnessControls
+                freshness={vsFreshness}
+                onRefresh={refreshVs}
+                refreshing={refreshing}
+              />
+            </div>
           </AnimatedItem>
         )}
 
@@ -1928,7 +1404,7 @@ export default function VSDetailPage() {
               {/* A brand-new Stellar account cannot hold USDC until it trusts the
                   issuer, so the first-ever stake needs this once. Renders nothing
                   for an account that is already set up. */}
-              {canAccept && <UsdcTrustlineGate />}
+              {canAccept && <UsdcTrustlineGate trustline={trustline} />}
 
               {canAccept && (
                 <GlassCard glass className="!rounded-2xl border border-pv-ink/[0.12]">
@@ -1946,7 +1422,7 @@ export default function VSDetailPage() {
                         variant="fuch"
                         onClick={handleAccept}
                         loading={actionLoading === "accept"}
-                        disabled={!hasValidChallengeStake}
+                        disabled={!hasValidChallengeStake || !acceptTrustlineGate.allowed}
                         className="h-[3.25rem] w-full"
                       >
                         {actionLoading === "accept"
@@ -1959,17 +1435,20 @@ export default function VSDetailPage() {
                     {stakePreview && (
                       <div className="mt-4 overflow-hidden rounded-xl border border-pv-ink/[0.1] bg-pv-bg/35">
                         {/* Total return, returned principal and net profit are shown
-                            separately — a single "payout" number reads as profit. */}
+                            separately — a single "payout" number reads as profit.
+                            Every figure is after the claim's snapshotted fees when
+                            they could be read, so `totalReturn` is what lands in the
+                            wallet, which is what that word has always meant here. */}
                         <div className="grid grid-cols-1 gap-px bg-pv-ink/[0.07] p-px sm:grid-cols-2">
                           <div className="min-w-0 bg-pv-bg/70 px-3.5 py-3">
                             <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-pv-muted">
                               {t("totalReturn")}
                             </div>
                             <div className="mt-1.5 font-mono text-sm font-bold tabular-nums text-pv-emerald sm:text-base">
-                              {formatUsdc(stakePreview.totalReturn)}
+                              {formatUsdc(stakePreview.netPayout)}
                             </div>
                             <div className="mt-1 font-mono text-[10px] tabular-nums text-pv-muted">
-                              {stakePreview.totalReturnMultiple.toFixed(2)}× {t("totalReturnMultipleHint")}
+                              {stakePreview.netMultiple.toFixed(2)}× {t("totalReturnMultipleHint")}
                             </div>
                           </div>
                           <div className="min-w-0 bg-pv-bg/70 px-3.5 py-3">
@@ -1977,7 +1456,7 @@ export default function VSDetailPage() {
                               {t("returnedPrincipal")}
                             </div>
                             <div className="mt-1.5 font-mono text-sm font-bold tabular-nums text-pv-text sm:text-base">
-                              {formatUsdc(stakePreview.returnedPrincipal)}
+                              {formatUsdc(stakePreview.principal)}
                             </div>
                           </div>
                           <div className="min-w-0 bg-pv-bg/70 px-3.5 py-3">
@@ -1996,6 +1475,29 @@ export default function VSDetailPage() {
                               {formatUsdc(creatorPayoutPreview)}
                             </div>
                           </div>
+                        </div>
+                        {/* The fee is stated, not implied. When the snapshot could
+                            not be read the gross is shown and labelled as such —
+                            an unlabelled gross would read as take-home. */}
+                        <div className="border-t border-pv-ink/[0.07] px-3.5 py-3 text-xs leading-relaxed">
+                          {stakePreview.clamped ? (
+                            <p className="text-pv-gold">{t("payoutFeeClamped")}</p>
+                          ) : stakePreview.feeAdjusted ? (
+                            <p className="text-pv-muted">
+                              {t("payoutFeeLine", { fee: formatUsdc(stakePreview.totalFee) })}
+                              {stakePreview.agentOwnerFee > 0
+                                ? ` ${t("payoutFeeSplit", {
+                                    platform: formatUsdc(stakePreview.platformFee),
+                                    owner: formatUsdc(stakePreview.agentOwnerFee),
+                                  })}`
+                                : null}
+                            </p>
+                          ) : stakePreview.feeStatus === "loading" ? (
+                            <p className="text-pv-muted">{t("payoutFeeChecking")}</p>
+                          ) : (
+                            <p className="text-pv-gold">{t("payoutFeeUnknown")}</p>
+                          )}
+                          <p className="mt-1 text-pv-muted">{t("principalGuarantee")}</p>
                         </div>
                         {isFixedOdds && (
                           <p
@@ -2018,7 +1520,7 @@ export default function VSDetailPage() {
                         {stakePreview.isLowUpside && (
                           <p className="border-t border-pv-gold/25 bg-pv-gold/[0.07] px-3.5 py-3 text-xs leading-relaxed text-pv-gold">
                             {t("lowUpsideWarning", {
-                              stake: formatUsdc(stakePreview.returnedPrincipal),
+                              stake: formatUsdc(stakePreview.principal),
                               profit: formatUsdc(stakePreview.netProfit),
                             })}
                           </p>
@@ -2039,7 +1541,7 @@ export default function VSDetailPage() {
                     )}
                     <p className="text-xs text-pv-muted mt-3">
                       {canonicalMode.settlementMode === "fixed_odds" && stakePreview
-                        ? t("challengeStakeHintFixed", { payout: stakePreview.totalReturn })
+                        ? t("challengeStakeHintFixed", { payout: stakePreview.netPayout })
                         : t("challengeStakeHintPool")}
                     </p>
                     <p className="text-xs text-pv-muted mt-2">
@@ -2540,3 +2042,21 @@ export default function VSDetailPage() {
     </>
   );
 }
+
+// ── Section components (extracted from this page) ────────────────────────────
+// The page file used to inline the progress bar, the challengers card, the
+// design-preview builders and the resolve-animation timing constants. They now
+// live in `components/vs/detail/*` and `lib/vs/detail-preview.ts` so that each
+// VS-page issue can touch one section without conflicting with the others.
+// Re-exported here so existing imports from this module keep working.
+export { ProgressBar } from "@/components/vs/detail/ProgressBar";
+export { VsChallengersCard } from "@/components/vs/detail/VsChallengersCard";
+export {
+  buildDesignPreviewVs,
+  buildDesignPreviewRematchChain,
+  formatChallengers,
+  txToastOptions,
+  VERDICT_OVERLAY_MS,
+  RESOLVE_PHASE_MS,
+  RESOLVE_ANIM_TOTAL_MS,
+} from "@/lib/vs/detail-preview";

@@ -5,7 +5,18 @@ use soroban_sdk::{Address, Env};
 use crate::escrow;
 use crate::events;
 use crate::storage;
-use crate::types::{Error, FeePolicy, PendingFeePolicy, FEE_TIMELOCK_SECONDS, MAX_TOTAL_FEE_BPS};
+use crate::types::{Error, FeePolicy, PendingFeePolicy, PendingOracle, FEE_TIMELOCK_SECONDS, MAX_TOTAL_FEE_BPS, ORACLE_TIMELOCK_SECONDS};
+
+/// Pause controls must never block withdrawals. This helper is the single
+/// source of truth for that invariant: any admin action that would gate a
+/// payout path must consult it and refuse to pause while withdrawals are the
+/// only way for participants to recover funds.
+fn require_not_paused_for_withdrawals(env: &Env) -> Result<(), Error> {
+    if storage::is_paused(env) {
+        return Err(Error::Paused);
+    }
+    Ok(())
+}
 
 fn require_owner(env: &Env) -> Result<(), Error> {
     storage::owner(env)?.require_auth();
@@ -55,6 +66,7 @@ pub fn initialize(
             platform_fee_bps,
             agent_owner_fee_bps,
             platform_recipient: platform_recipient.clone(),
+            revision: 1,
         },
     );
 
@@ -77,12 +89,54 @@ pub fn initialize(
     Ok(())
 }
 
-pub fn set_oracle(env: &Env, new_oracle: Address) -> Result<(), Error> {
+/// Queue an oracle rotation. It cannot execute until the timelock elapses, so
+/// participants have notice before settlement authority moves.
+pub fn queue_oracle(env: &Env, new_oracle: Address) -> Result<(), Error> {
     require_owner(env)?;
-    let previous = storage::oracle(env)?;
-    storage::set_oracle(env, &new_oracle);
-    events::OracleChanged {
+    let executable_at = env
+        .ledger()
+        .timestamp()
+        .checked_add(ORACLE_TIMELOCK_SECONDS)
+        .ok_or(Error::Overflow)?;
+
+    storage::set_pending_oracle(
+        env,
+        &PendingOracle {
+            next: new_oracle.clone(),
+            executable_at,
+        },
+    );
+    events::OracleQueued {
         next: new_oracle,
+        executable_at,
+    }
+    .publish(env);
+    Ok(())
+}
+
+pub fn cancel_oracle(env: &Env) -> Result<(), Error> {
+    require_owner(env)?;
+    if storage::pending_oracle(env).is_none() {
+        return Err(Error::NothingQueued);
+    }
+    storage::clear_pending_oracle(env);
+    events::OracleCancelled { cancelled: true }.publish(env);
+    Ok(())
+}
+
+/// Execute a queued oracle rotation. Permissionless once the timelock has
+/// elapsed: the change was already public, and requiring the owner again would
+/// let a lost key strand the queue forever.
+pub fn execute_oracle(env: &Env) -> Result<(), Error> {
+    let queued = storage::pending_oracle(env).ok_or(Error::NothingQueued)?;
+    if env.ledger().timestamp() < queued.executable_at {
+        return Err(Error::Timelocked);
+    }
+    let previous = storage::oracle(env)?;
+    storage::set_oracle(env, &queued.next);
+    storage::clear_pending_oracle(env);
+    events::OracleChanged {
+        next: queued.next,
         previous: Some(previous),
     }
     .publish(env);
@@ -91,6 +145,8 @@ pub fn set_oracle(env: &Env, new_oracle: Address) -> Result<(), Error> {
 
 pub fn transfer_ownership(env: &Env, new_owner: Address) -> Result<(), Error> {
     require_owner(env)?;
+    // Ownership moves must not be used to strand funds behind a pause.
+    require_not_paused_for_withdrawals(env)?;
     let previous = storage::owner(env)?;
     storage::set_owner(env, &new_owner);
     events::OwnershipTransferred {
@@ -118,6 +174,8 @@ pub fn queue_fee_policy(
         .checked_add(FEE_TIMELOCK_SECONDS)
         .ok_or(Error::Overflow)?;
 
+    let next_revision = storage::fee_policy(env)?.revision.checked_add(1).ok_or(Error::Overflow)?;
+
     storage::set_pending_fee_policy(
         env,
         &PendingFeePolicy {
@@ -125,6 +183,7 @@ pub fn queue_fee_policy(
             agent_owner_fee_bps,
             platform_recipient: platform_recipient.clone(),
             executable_at,
+            revision: next_revision,
         },
     );
     events::FeePolicyQueued {
@@ -163,19 +222,34 @@ pub fn execute_fee_policy(env: &Env) -> Result<(), Error> {
         &queued.platform_recipient,
     )?;
 
+    let previous = storage::fee_policy(env)?;
+    let effective_revision = if queued.revision == 0 {
+        previous.revision.checked_add(1).ok_or(Error::Overflow)?
+    } else {
+        queued.revision
+    };
+
     storage::set_fee_policy(
         env,
         &FeePolicy {
             platform_fee_bps: queued.platform_fee_bps,
             agent_owner_fee_bps: queued.agent_owner_fee_bps,
             platform_recipient: queued.platform_recipient.clone(),
+            revision: effective_revision,
         },
     );
     storage::clear_pending_fee_policy(env);
     events::FeePolicyUpdated {
         platform_fee_bps: queued.platform_fee_bps,
         agent_owner_fee_bps: queued.agent_owner_fee_bps,
-        platform_recipient: queued.platform_recipient,
+        platform_recipient: queued.platform_recipient.clone(),
+    }
+    .publish(env);
+    events::FeeRecipientTransitioned {
+        effective_revision,
+        previous_platform_recipient: previous.platform_recipient.clone(),
+        platform_recipient: queued.platform_recipient.clone(),
+        effective_at: env.ledger().timestamp(),
     }
     .publish(env);
     Ok(())

@@ -25,9 +25,13 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
 
 import { useWallet } from "@/lib/wallet";
 import { challengeClaim } from "@/lib/contract";
+import { formatMirrorAtomicUsdc } from "@/lib/baskets";
+import { evaluateUsdcTrustlineGate } from "@/lib/usdcTrustlineGate";
+import Link from "next/link";
 import {
   UsdcTrustlineGate,
   useUsdcTrustline,
@@ -40,15 +44,26 @@ interface Mirror {
   question: string;
   agentId: string;
   agentName: string;
-  memberStakeUsdc: number;
-  mirrorUsdc: number;
+  memberStakeAtomic: string;
+  mirrorAmountAtomic: string;
+  side?: string;
+  marketId?: string;
   weightBps: number;
   deadline: number;
 }
 
 export function PendingMirrors() {
+  const t = useTranslations("wallet");
   const { address, isConnected, signer } = useWallet();
   const trustline = useUsdcTrustline();
+  const trustlineGate = evaluateUsdcTrustlineGate({
+    action: "mirror",
+    status: trustline.status,
+    loading: trustline.loading,
+    stale: trustline.stale,
+    isConnected,
+    hasSigner: Boolean(signer),
+  });
   const [mirrors, setMirrors] = useState<Mirror[]>([]);
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -74,13 +89,24 @@ export function PendingMirrors() {
   }, [load]);
 
   async function mirror(item: Mirror) {
-    if (!signer) return;
+    if (!isConnected || !address || !signer) {
+      setError(t(!isConnected || !address ? "connectWalletFirst" : "cannotSign"));
+      return;
+    }
+    if (!trustlineGate.allowed) {
+      setError(t(trustlineGate.messageKey));
+      return;
+    }
     setBusyId(item.claimId);
     setError(null);
     try {
       // One call, one signature. The auth entry inside it is what moves the USDC,
       // so there is no approve step to get wrong and no allowance left behind.
-      const result = await challengeClaim(signer, item.claimId, item.mirrorUsdc);
+      const result = await challengeClaim(
+        signer,
+        item.claimId,
+        Number(formatMirrorAtomicUsdc(item.mirrorAmountAtomic)),
+      );
       setDone((current) => ({ ...current, [item.claimId]: result.txHash || "sent" }));
       // Refresh rather than splice: the queue is derived from chain state, and the
       // authoritative answer to "is it still pending" is the server's.
@@ -100,7 +126,7 @@ export function PendingMirrors() {
   if (!isConnected) return null;
   if (!loading && mirrors.length === 0) return null;
 
-  const blocked = trustline.status === "missing" || trustline.status === "unfunded";
+  const blocked = !trustlineGate.allowed;
 
   return (
     <section className="border border-pv-emerald/35 bg-pv-emerald/[0.05] p-4">
@@ -114,7 +140,11 @@ export function PendingMirrors() {
         </p>
       </div>
 
-      <UsdcTrustlineGate trustline={trustline} className="mb-3" />
+      <UsdcTrustlineGate
+        trustline={trustline}
+        className="mb-3"
+        onReady={() => void load()}
+      />
 
       {loading && mirrors.length === 0 && (
         <p className="py-3 text-[12px] text-pv-muted">Checking…</p>
@@ -132,23 +162,21 @@ export function PendingMirrors() {
               </span>
               <span className="block font-mono text-[10px] text-pv-muted">
                 {item.basketName} · {item.agentName} staked{" "}
-                {item.memberStakeUsdc.toFixed(2)} · your weight{" "}
+                {formatMirrorAtomicUsdc(item.memberStakeAtomic, 2)} · your weight{" "}
                 {(item.weightBps / 100).toFixed(0)}%
               </span>
             </span>
             {done[item.claimId] ? (
               <span className="font-mono text-[11px] text-pv-emerald">mirrored ✓</span>
             ) : (
-              <button
-                type="button"
-                onClick={() => void mirror(item)}
-                disabled={busyId !== null || blocked || !signer}
-                className="btn-compact-primary shrink-0 px-3 py-1.5 text-[12px] disabled:opacity-40"
+              <Link
+                href={`/vs/${item.claimId}?side=${encodeURIComponent(
+                  item.side ?? "yes",
+                )}&amount=${encodeURIComponent(formatMirrorAtomicUsdc(item.mirrorAmountAtomic, 2))}`}
+                className="btn-compact-primary shrink-0 px-3 py-1.5 text-[12px]"
               >
-                {busyId === item.claimId
-                  ? "Confirm in wallet…"
-                  : `Mirror ${item.mirrorUsdc.toFixed(2)} USDC`}
-              </button>
+                Mirror {formatMirrorAtomicUsdc(item.mirrorAmountAtomic, 2)} USDC
+              </Link>
             )}
           </li>
         ))}

@@ -1,4 +1,4 @@
-/**
+/*
  * Payments revenue ledger — tracks the x402 USDC settlements Mimir's paid
  * endpoints earn.
  *
@@ -14,14 +14,15 @@ import {
   getPaymentsRevenueSummary,
   type PaymentsRevenueSummary,
 } from "./db";
-import { parseUsdcAtomic, USDC_DECIMALS, USDC_SYMBOL, unitsToUsdc } from "./usdc";
+import { USDC_DECIMALS, USDC_SYMBOL, unitsToUsdc } from "./usdc";
+import type { VerificationTrace } from "./x402/decision-trace";
 
 export interface PaymentEvent {
   /** Which endpoint earned it (e.g. /api/premium/price). */
   resource: string;
   scheme: string;
   /**
-   * CAIP-2, e.g. `stellar:testnet` — the value `X402_NETWORK` resolves to in
+   * CAIP-2, e.g. `stellar:testnet` — the value `X02_NETWORK` resolves to in
    * `lib/x402/config.ts`, handed straight through by the `onAfterSettle` hook in
    * `lib/x402/server.ts` as `result.network`.
    */
@@ -36,6 +37,11 @@ export interface PaymentEvent {
   paymentIdentifier: string;
   facilitator: string;
   settledAt: number;
+  /**
+   * Optional privacy-safe verification decision trace. Never persisted to the
+   * durable store; only surfaced on the in-memory view.
+   */
+  verificationTrace?: VerificationTrace;
 }
 
 const MAX = 1000;
@@ -93,6 +99,8 @@ export interface RevenuePaymentView {
   seller: string | null;
   transactionHash: string | null;
   at: number;
+  /** Privacy-safe verification decision, present only for in-memory events. */
+  verification?: VerificationTrace;
 }
 
 export interface RevenueSummary {
@@ -306,7 +314,7 @@ function fromDbSummary(s: PaymentsRevenueSummary): RevenueSummary {
   };
 }
 
-function inMemorySummary(limit: number): RevenueSummary {
+function inMemorySummary(limit: number, offset: number): RevenueSummary {
   const byResource = new Map<string, { calls: number; atomic: bigint }>();
   const bySeller = new Map<string, { calls: number; atomic: bigint }>();
   const payers = new Set<string>();
@@ -314,7 +322,7 @@ function inMemorySummary(limit: number): RevenueSummary {
   let totalAtomic = 0n;
   for (const e of events) {
     totalAtomic += e.amountAtomic;
-    // Grouped on the exact strkey. Folding case here did not merely mis-key the
+    // Grouped on the exact string. Folding case here did not merely mis-key the
     // map: `bySeller` is keyed by this value and the key is what /revenue renders,
     // so a lowercased `G…` was surfaced to the UI as the seller's address.
     if (e.payer) payers.add(e.payer);
@@ -358,8 +366,9 @@ function inMemorySummary(limit: number): RevenueSummary {
         usdc: unitsToUsdc(v.atomic),
       })),
     recent: events
-      .slice(-limit)
+      .slice()
       .reverse()
+      .slice(offset, offset + limit)
       .map((e) => ({
         resource: e.resource,
         network: e.network,
@@ -371,13 +380,14 @@ function inMemorySummary(limit: number): RevenueSummary {
         seller: e.seller,
         transactionHash: e.transactionHash,
         at: e.settledAt,
+        ...(e.verificationTrace ? { verification: e.verificationTrace } : {}),
       })),
     market: EMPTY_MARKET,
   };
 }
 
 /** Durable summary from Neon; falls back to the in-memory buffer on any error. */
-export async function getRevenueSummary(limit = 25): Promise<RevenueSummary> {
+export async function getRevenueSummary(limit = 25, offset = 0): Promise<RevenueSummary> {
   const withBaseline = (s: RevenueSummary): RevenueSummary => {
     const calls = baselineCalls();
     const baseAtomic = baselineAtomic();
@@ -395,7 +405,7 @@ export async function getRevenueSummary(limit = 25): Promise<RevenueSummary> {
   };
   try {
     const [payments, market] = await Promise.all([
-      getPaymentsRevenueSummary(limit),
+      getPaymentsRevenueSummary(limit, offset),
       getMarketRevenueSummary(),
     ]);
     return {
@@ -417,6 +427,6 @@ export async function getRevenueSummary(limit = 25): Promise<RevenueSummary> {
       },
     };
   } catch {
-    return withBaseline(inMemorySummary(limit));
+    return withBaseline(inMemorySummary(limit, offset));
   }
 }

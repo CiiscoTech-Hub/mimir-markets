@@ -57,6 +57,7 @@ function parsePreviewInput(value: unknown, now: number): {
   if (!amount(usage.usedTodayUsdc) || !amount(usage.usedThisWeekUsdc) ||
       !amount(usage.openExposureUsdc) ||
       typeof usage.realizedLossAtomic !== "string" || !decimal.test(usage.realizedLossAtomic) ||
+      typeof usage.principalAtRiskAtomic !== "string" || !decimal.test(usage.principalAtRiskAtomic) ||
       !numbers(c.existingClaimIds, 1000) || !strings(c.ancestryAgentIds, 16) ||
       typeof c.configuredUsdc !== "string" || typeof c.configuredSpender !== "string" ||
       typeof c.onchainAllowanceAtomic !== "string" || !decimal.test(c.onchainAllowanceAtomic)) return null;
@@ -73,7 +74,7 @@ function parsePreviewInput(value: unknown, now: number): {
 }
 
 export async function POST(req: Request): Promise<Response> {
-  const gate = authorizeRequest("public_read", {
+  const gate = await authorizeRequest("public_read", {
     route: "/api/copy/preview",
     ip: req.headers.get("x-real-ip") ?? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? undefined,
   });

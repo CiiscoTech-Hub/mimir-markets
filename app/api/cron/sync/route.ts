@@ -2,7 +2,7 @@ import { authorizeRequest } from "@/lib/api/policy";
 import { NextResponse } from "next/server";
 
 import { beat } from "@/lib/ops/heartbeat";
-import { createApiError } from "@/lib/server/api-validation";
+import { apiError } from "@/lib/api/errors";
 import { reconcileVsIndex } from "@/lib/server/vs-index";
 
 export const dynamic = "force-dynamic";
@@ -27,10 +27,10 @@ const SYNC_INTERVAL_SEC = Number(process.env.SYNC_POLL_INTERVAL_MS ?? "300000") 
  * string compare on a secret leaks its length through timing. The tier also
  * applies the route rate limit, which this route previously had none of.
  */
-function authorizeWorker(request: Request, route: string) {
+async function authorizeWorker(request: Request, route: string) {
   const header = request.headers.get("authorization") ?? "";
   const presented = header.startsWith("Bearer ") ? header.slice(7) : "";
-  return authorizeRequest("internal_worker", {
+  return await authorizeRequest("internal_worker", {
     route,
     presentedSecret: presented,
     expectedSecret: process.env.CRON_SECRET,
@@ -41,7 +41,7 @@ export async function GET(request: Request) {
   // Authorized outside the try: an unauthenticated caller must never reach the
   // heartbeat below, not even through the error path, or it could keep a dead
   // sync worker looking merely degraded instead of missing.
-  const auth = authorizeWorker(request, "/api/cron/sync");
+  const auth = await authorizeWorker(request, "/api/cron/sync");
   if (!auth.allowed && auth.error) {
     // The tier's error already carries a machine-readable code, a retryable flag
     // and a Retry-After when waiting can help.
@@ -60,6 +60,8 @@ export async function GET(request: Request) {
         synced: summary.synced,
         new: summary.new,
         stateChanges: summary.stateChanges,
+        corrected: summary.corrected,
+        inconsistencies: summary.inconsistencies,
       },
       {
         headers: {
@@ -70,9 +72,7 @@ export async function GET(request: Request) {
   } catch (error) {
     // Alive and failing, which staleness alone would report as healthy.
     await beat("sync", { error, intervalSec: SYNC_INTERVAL_SEC });
-    return NextResponse.json(
-      createApiError("internal_error", "Unable to reconcile VS index"),
-      { status: 500 }
-    );
+    const err = apiError("internal_error", "Unable to reconcile VS index");
+    return NextResponse.json(err.body, { status: err.status, headers: err.headers });
   }
 }

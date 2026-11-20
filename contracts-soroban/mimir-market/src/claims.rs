@@ -12,6 +12,79 @@ use crate::types::{
 };
 use crate::util;
 
+/// Number of claim ids stored per creator-index page. Bounds the size of any
+/// single persistent entry written by `create_claim`.
+const CREATOR_INDEX_PAGE_SIZE: u32 = 100;
+
+fn creator_index_page_key(env: &Env, creator: &Address, page: u32) {
+    (
+        soroban_sdk::symbol_short!("cclm_pg"),
+        creator.clone(),
+        page,
+    )
+}
+
+fn creator_index_count_key(env: &Env, creator: &Address) {
+    (soroban_sdk::symbol_short!("cclm_ct"), creator.clone())
+}
+
+pub fn creator_index_append(env: &Env, creator: &Address, id: u64) {
+    let count_key = creator_index_count_key(env, creator);
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let page = count / CREATOR_INDEX_PAGE_SIZE;
+    let key = creator_index_page_key(env, creator, page);
+    let mut ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    ids.push_back(id);
+    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().set(&count_key, &(count + 1));
+}
+
+pub fn get_creator_claims(
+    env: &Env,
+    creator: Address,
+    offset: u32,
+    limit: u32,
+) -> (Vec<u64>, u32) {
+    let count_key = creator_index_count_key(env, &creator);
+    let total: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let mut out = Vec::new(env);
+    if limit == 0 || offset >= total {
+        return (out, total);
+    }
+    let mut remaining = limit.min(total - offset);
+    let mut index = offset;
+    while remaining > 0 {
+        let page = index / CREATOR_INDEX_PAGE_SIZE;
+        let key = creator_index_page_key(env, &creator, page);
+        let ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+        let page_start = page * CREATOR_INDEX_PAGE_SIZE;
+        let mut local = index - page_start;
+        while local < ids.len() && remaining > 0 {
+            out.push_back(ids.get(local).unwrap());
+            local += 1;
+            index += 1;
+            remaining -= 1;
+        }
+        if local >= ids.len() && remaining > 0 {
+            // Defensive: short page but count says more; avoid infinite loop.
+            break;
+        }
+    }
+    // TTL extension like other reads.
+    env.storage().persistent().extend_ttl(&count_key, 30, env.ledger().max_ttl() / 2);
+    if out.len() > 0 {
+        let first_page = offset / CREATOR_INDEX_PAGE_SIZE;
+        let last_page = (index - 1) / CREATOR_INDEX_PAGE_SIZE;
+        let mut p = first_page;
+        while p <= last_page {
+            let key = creator_index_page_key(env, &creator, p);
+            env.storage().persistent().extend_ttl(&key, 30, env.ledger().max_ttl() / 2);
+            p += 1;
+        }
+    }
+    (out, total)
+}
+
 pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result<u64, Error> {
     creator.require_auth();
 
@@ -24,6 +97,10 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
     if params.question.is_empty() {
         return Err(Error::EmptyQuestion);
     }
+    // Bound the metadata this claim will commit to persistent storage BEFORE
+    // any money moves: an over-long claim is refused with nothing escrowed and
+    // no claim id consumed, so a rejected caller can retry with less text.
+    util::validate_create_metadata(env, &params)?;
 
     let usdc = storage::usdc(env)?;
     escrow::pull(env, &usdc, &creator, params.stake_amount)?;
@@ -39,8 +116,7 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
         0
     };
 
-    let max_challengers = if params.max_challengers == 0 || params.max_challengers > MAX_CHALLENGERS
-    {
+    let max_challengers = if params.max_challengers == 0 || params.max_challengers > MAX_CHALLENGERS {
         MAX_CHALLENGERS
     } else {
         params.max_challengers
@@ -92,17 +168,25 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
             challenger_payout_bps: payout_bps,
             handicap_line: params.handicap_line,
             settlement_rule: params.settlement_rule,
-            max_challengers,
+            max_challengers: max_challengers,
             is_private: params.is_private,
             invite_key_hash,
         },
-        fees: snapshot,
+        fees: snapshot.clone(),
     };
 
     let category = claim.category.clone();
     storage::set_claim(env, id, &claim);
     storage::set_challengers(env, id, &Vec::new(env));
+    creator_index_append(env, &creator, id);
 
+    events::EscrowSeeded {
+        id,
+        funder: creator.clone(),
+        amount: params.stake_amount,
+        escrow_type: String::from_str(env, "creator_stake"),
+    }
+    .publish(env);
     events::ClaimCreated {
         id,
         creator,
@@ -111,10 +195,10 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
     .publish(env);
     events::FeePolicySnapshotted {
         id,
-        platform_fee_bps: snapshot.platform_fee_bps,
-        agent_owner_fee_bps: snapshot.agent_owner_fee_bps,
-        platform_recipient: snapshot.platform_recipient.clone(),
-        agent_owner_recipient: snapshot.agent_owner_recipient.clone(),
+        platform_fee_bps: claim.fees.platform_fee_bps,
+        agent_owner_fee_bps: claim.fees.agent_owner_fee_bps,
+        platform_recipient: claim.fees.platform_recipient.clone(),
+        agent_owner_recipient: claim.fees.agent_owner_recipient.clone(),
     }
     .publish(env);
     if let Some(agent) = params.agent_owner_recipient {
@@ -147,10 +231,11 @@ pub fn challenge_claim(
     let mut list = storage::challengers(env, claim_id);
     for existing in list.iter() {
         if existing.address == challenger {
-            return Err(Error::AlreadyChallenged);
+            return Ok(());
         }
     }
-    if claim.challenger_count >= claim.market.max_challengers {
+    let max_challengers = claim.market.max_challengers.min(MAX_CHALLENGERS);
+    if claim.challenger_count >= max_challengers || list.len() >= max_challengers {
         return Err(Error::ClaimFull);
     }
     if stake_amount < MIN_STAKE {
@@ -185,19 +270,39 @@ pub fn challenge_claim(
         return Err(Error::DuelNeedsEqualStake);
     }
 
+    let mut fixed_odds_gross = 0;
+    let mut fixed_odds_profit = 0;
     if util::is_fixed_odds(env, &claim.market.odds_mode) {
-        let gross = fees::gross_payout(stake_amount, claim.market.challenger_payout_bps)?;
-        let profit = if gross > stake_amount {
-            gross - stake_amount
+        fixed_odds_gross = fees::gross_payout(stake_amount, claim.market.challenger_payout_bps)?;
+        fixed_odds_profit = if fixed_odds_gross > stake_amount {
+            fixed_odds_gross - stake_amount
         } else {
             0
         };
-        let available = claim.creator_stake - claim.reserved_creator_liability;
-        if available < profit {
+        // Treat a corrupt/legacy claim with more liability than principal as
+        // underfunded rather than allowing a negative "available" balance or a
+        // wrapping subtraction in the release build.
+        let available = claim
+            .creator_stake
+            .checked_sub(claim.reserved_creator_liability)
+            .ok_or(Error::InsufficientCreatorLiquidity)?;
+        if available < fixed_odds_profit {
             return Err(Error::InsufficientCreatorLiquidity);
         }
-        claim.reserved_creator_liability += profit;
+        claim.reserved_creator_liability = claim
+            .reserved_creator_liability
+            .checked_add(fixed_odds_profit)
+            .ok_or(Error::Overflow)?;
     }
+
+    let next_total_challenger_stake = claim
+        .total_challenger_stake
+        .checked_add(stake_amount)
+        .ok_or(Error::Overflow)?;
+    let next_challenger_count = claim
+        .challenger_count
+        .checked_add(1)
+        .ok_or(Error::Overflow)?;
 
     let usdc = storage::usdc(env)?;
     escrow::pull(env, &usdc, &challenger, stake_amount)?;
@@ -209,10 +314,46 @@ pub fn challenge_claim(
     });
     storage::set_challengers(env, claim_id, &list);
 
-    claim.total_challenger_stake += stake_amount;
-    claim.challenger_count += 1;
+    let prev_state = claim.state;
+    claim.total_challenger_stake = next_total_challenger_stake;
+    claim.challenger_count = next_challenger_count;
     claim.state = ClaimState::Active;
+    util::assert_claim_conservation(&claim)?;
     storage::set_claim(env, claim_id, &claim);
+
+    events::EscrowSeeded {
+        id: claim_id,
+        funder: challenger.clone(),
+        amount: stake_amount,
+        escrow_type: String::from_str(env, "challenger_stake"),
+    }
+    .publish(env);
+
+    if prev_state != ClaimState::Active {
+        events::ClaimStateTransitioned {
+            id: claim_id,
+            from_state: prev_state as u32,
+            to_state: ClaimState::Active as u32,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(env);
+    }
+
+    if util::is_fixed_odds(env, &claim.market.odds_mode) {
+        events::FixedOddsLiquidityReserved {
+            id: claim_id,
+            challenger: challenger.clone(),
+            stake: stake_amount,
+            gross: fixed_odds_gross,
+            profit: fixed_odds_profit,
+            reserved_creator_liability: claim.reserved_creator_liability,
+            available_creator_liquidity: claim
+                .creator_stake
+                .checked_sub(claim.reserved_creator_liability)
+                .ok_or(Error::InsufficientCreatorLiquidity)?,
+        }
+        .publish(env);
+    }
 
     events::ClaimChallenged {
         id: claim_id,
@@ -223,22 +364,111 @@ pub fn challenge_claim(
     Ok(())
 }
 
-pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
+
+pub fn transition_deadline(env: &Env, claim_id: u64) -> Result<(), Error> {
     let mut claim = storage::get_claim(env, claim_id)?;
-    claim.creator.require_auth();
+    if claim.state == ClaimState::Active {
+        return Ok(());
+    }
     if claim.state != ClaimState::Open {
         return Err(Error::ClaimNotOpen);
     }
+    if env.ledger().timestamp() < claim.deadline {
+        return Err(Error::Timelocked);
+    }
+
+    events::DeadlineReached {
+        id: claim_id,
+        deadline: claim.deadline,
+        challenger_count: claim.challenger_count,
+        total_staked: claim.creator_stake,
+    }
+    .publish(env);
 
     claim.state = ClaimState::Cancelled;
     let creator = claim.creator.clone();
     let refund = claim.creator_stake;
+
+    events::ClaimStateTransitioned {
+        id: claim_id,
+        from_state: ClaimState::Open as u32,
+        to_state: ClaimState::Cancelled as u32,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
+
     storage::set_claim(env, claim_id, &claim);
 
-    // Cancellation is a refund: no fee.
+    // Cancellation is a refund: no fee. Same parked-flag semantics as
+    // `cancel_claim` below: report the DELTA, because the creator may already
+    // hold a parked balance from an earlier settlement that is not this refund.
     let usdc = storage::usdc(env)?;
+    let pending_before = storage::withdrawable(env, &creator);
     escrow::push_or_park(env, &usdc, &creator, refund);
 
-    events::ClaimCancelled { id: claim_id }.publish(env);
+    events::ClaimCancelled {
+        id: claim_id,
+        refund,
+        parked: storage::withdrawable(env, &creator) > pending_before,
+    }
+    .publish(env);
+    Ok(())
+}
+
+pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
+    let mut claim = storage::get_claim(env, claim_id)?;
+    claim.creator.require_auth();
+    if claim.state == ClaimState::Cancelled {
+        return Ok(());
+    }
+    if claim.state != ClaimState::Open {
+        return Err(Error::ClaimNotOpen);
+    }
+
+    // Cancellation is the one lifecycle transition where the creator, not the
+    // oracle, moves money out of escrow. The state check above is what every
+    // caller knows; the checks below are what the CONTRACT knows. They guard
+    // against the two ways a refund could diverge from the escrow the claim
+    // actually holds, whatever the caller believes.
+    //
+    // 1) A claim that already accepted challengers is no longer a refund:
+    //    the creator cannot unilaterally pull out while counterparty money
+    //    is locked. That would break conservation and cheat challengers.
+    // 2) The refund must never exceed the creator stake the claim actually
+    //    holds; the conservation invariant is the authority for this.
+    if claim.challenger_count > 0 || claim.total_challenger_stake > 0 {
+        return Err(Error::ClaimNotOpen);
+    }
+    util::assert_claim_conservation(&claim)?;
+
+    let creator = claim.creator.clone();
+    let refund = claim.creator_stake;
+    claim.state = ClaimState::Cancelled;
+    claim.remaining_escrow = 0;
+    storage::set_claim(env, claim_id, &claim);
+
+    events::ClaimStateTransitioned {
+        id: claim_id,
+        from_state: ClaimState::Open as u32,
+        to_state: ClaimState::Cancelled as u32,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
+
+    // Refunds are always allowed, even when the contract is paused: pause
+    // controls must never block withdrawals or refunds of already-committed
+    // funds. The check is done here (not in escrow), so the pause flag is
+    // explicit at the call site and testable independently of escrow.
+    // NOTE: this function is deliberately NOT gated on the pause flag.
+    let usdc = storage::usdc(env)?;
+    let pending_before = storage::withdrawable(env, &creator);
+    escrow::push_or_park(env, &usdc, &creator, refund);
+
+    events::ClaimCancelled {
+        id: claim_id,
+        refund,
+        parked: storage::withdrawable(env, &creator) > pending_before,
+    }
+    .publish(env);
     Ok(())
 }

@@ -6,6 +6,10 @@
  * The signature is the whole authorisation: a basket earns its creator a fee, so
  * "who made this" has to be something they proved rather than something they
  * typed. Same reasoning as agent registration.
+ *
+ * The signed message carries a nonce and an expiry timestamp (the same pattern
+ * as ownership transfers), so a captured signature cannot be replayed to create
+ * duplicate baskets.
  */
 
 import { randomUUID } from "node:crypto";
@@ -13,53 +17,43 @@ import { NextResponse, type NextRequest } from "next/server";
 import { isStellarAccount, verifyStellarSignedMessage } from "@/lib/stellar-message";
 
 import { apiError } from "@/lib/api/errors";
+import { clientIpFrom } from "@/lib/api/origin";
 import { authorizeRequest } from "@/lib/api/policy";
-import { validateBasket, type BasketAgentWeight } from "@/lib/baskets";
+import { BASKET_EXPIRY_MS, basketMessage, transferMessage, validateBasket, type BasketAgentWeight } from "@/lib/baskets";
 import { DEFAULT_BASKET_POLICY } from "@/lib/server/basket-directory";
 import { listDirectoryAgents } from "@/lib/server/agent-directory";
+import { consumeNonce } from "@/lib/server/nonce-store";
 import { insertBasket, listBaskets } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
-/**
- * What the creator signs. Readable, because a hardware wallet shows it verbatim.
- *
- * The address is interpolated verbatim: a Stellar strkey is case-sensitive
- * base32, so the `toLowerCase()` this line used to carry — harmless for a hex EVM
- * address — would produce a string no wallet ever signed.
- */
-export function basketMessage(args: {
-  name: string; creator: string; members: Array<{ agentId: string; weightBps: number }>;
-}): string {
-  return [
-    "Mimir basket",
-    `name: ${args.name}`,
-    `creator: ${args.creator}`,
-    `members: ${args.members.map((m) => `${m.agentId}:${m.weightBps}`).join(",")}`,
-  ].join("\n");
-}
+// Re-export so callers that import from this route path still resolve them —
+// the canonical source is now lib/baskets.ts (importable in tests without the
+// Next.js server stack), but nothing outside this file imported these before.
+export { basketMessage, transferMessage };
 
 function slugify(name: string): string {
-  return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+  return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-+$/g, "").slice(0, 60);
 }
 
-function clientIp(req: NextRequest): string | undefined {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || undefined;
-}
-
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const gate = authorizeRequest("public_read", { route: "/api/baskets", ip: clientIpFrom(req.headers) });
+  if (!gate.allowed && gate.error) {
+    return NextResponse.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
+  }
   const baskets = await listBaskets().catch(() => []);
   return NextResponse.json({ baskets }, { headers: { "cache-control": "no-store" } });
 }
 
 export async function POST(req: NextRequest) {
-  const gate = authorizeRequest("public_read", { route: "/api/baskets", ip: clientIp(req) });
+  const gate = authorizeRequest("public_read", { route: "/api/baskets", ip: clientIpFrom(req.headers) });
   if (!gate.allowed && gate.error) {
     return NextResponse.json(gate.error.body, { status: gate.error.status, headers: gate.error.headers });
   }
 
   let body: {
     name?: string; thesis?: string; creator?: string; signature?: string;
+    nonce?: string; expiresAt?: number | string;
     members?: Array<{ agentId?: string; weightBps?: number }>;
   };
   try {
@@ -101,6 +95,29 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(err.body, { status: err.status });
   }
 
+  // Nonce + expiry: the same pattern as ownership transfers. The nonce is consumed
+  // only after the signature verifies, so an invalid signature cannot burn a
+  // valid nonce.
+  const nonce = String(body.nonce ?? "").trim();
+  if (!nonce || nonce.length > 200) {
+    const err = apiError("invalid_request", "nonce is required");
+    return NextResponse.json(err.body, { status: err.status });
+  }
+  const expiresAt = typeof body.expiresAt === "string" ? Date.parse(body.expiresAt) : Number(body.expiresAt);
+  if (!Number.isFinite(expiresAt)) {
+    const err = apiError("invalid_request", "expiresAt is required");
+    return NextResponse.json(err.body, { status: err.status });
+  }
+  const now = Date.now();
+  if (expiresAt <= now) {
+    const err = apiError("invalid_signature", "signature expired");
+    return NextResponse.json(err.body, { status: err.status });
+  }
+  if (expiresAt - now > BASKET_EXPIRY_MS) {
+    const err = apiError("invalid_signature", "expiry too far in the future");
+    return NextResponse.json(err.body, { status: err.status });
+  }
+
   const signature = String(body.signature ?? "").trim();
   if (!signature) {
     const err = apiError("invalid_signature", "creator signature is required");
@@ -108,12 +125,20 @@ export async function POST(req: NextRequest) {
   }
   const valid = verifyStellarSignedMessage({
     address: creator,
-    message: basketMessage({ name, creator, members }),
+    message: basketMessage({ name, creator, members, nonce, expiresAt }),
     signature,
   });
   if (!valid) {
     const err = apiError("invalid_signature", "creator signature rejected");
     return NextResponse.json(err.body, { status: err.status });
+  }
+
+  // Consume the nonce only after the signature checks out. The nonce store is
+  // namespaced by creator so two different wallets can never collide.
+  const consumed = await consumeNonce(`basket-create:${creator}`, nonce, now).catch(() => false);
+  if (!consumed) {
+    const err = apiError("conflict", "nonce already used");
+    return NextResponse.json(err.body, { status: 409 });
   }
 
   // Suffixed with a short random tail: two people naming a basket "Momentum" must

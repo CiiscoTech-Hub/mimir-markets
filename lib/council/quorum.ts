@@ -1,5 +1,5 @@
 /**
- * Council quorum + fallback rules for settlement (§agents / RFB council boundary).
+ * Council quorum + fallback rules for settlement (agents / RFB council boundary).
  *
  * `gatherCouncilVerdict` buys persona votes and tallies them. This module is the
  * pure policy layer that decides whether that tally is allowed to settle a claim,
@@ -11,12 +11,19 @@
  * failures degrade to solo oracle settlement rather than inventing a majority.
  *
  * Pure: no I/O. Callers classify each attempt, then ask {@link evaluateQuorum}.
+ *
+ * Policy revision: every evaluation carries `policyRevision`, a stable reference
+ * identifying the rule set that produced the decision. It is derived from the
+ * policy's *effective* parameters (quorum after normalization), not from the
+ * default constants themselves, so changing a default in a future release does
+ * not silently rewrite the reference recorded for historical ballots. Replaying
+ * a captured ballot under a pinned revision yields the identical decision.
  */
 
 import { isVerdict, type Verdict } from "../verdict";
 
 /** Claim lifecycle states the quorum gate cares about. */
-export type ClaimSettleState = "open" | "active" | "resolved" | "cancelled";
+export type ClaimSettleState = "open" | "active" | "resolved" | "cancelled" | "paused";
 
 /**
  * What happened to one persona vote attempt before it may enter the ballot.
@@ -36,6 +43,7 @@ export type VoteDisposition =
   | "stale"
   | "duplicated"
   | "cancelled"
+  | "paused"
   | "dependency_failure";
 
 export type FallbackAction =
@@ -47,6 +55,8 @@ export type FallbackAction =
   | "abort_cancelled"
   /** Claim already resolved — a new council pass would be stale. */
   | "abort_resolved"
+  /** Claim is paused — council must not settle it. */
+  | "abort_paused"
   /** Quorum config is unusable after normalization refusal. */
   | "abort_invalid_config";
 
@@ -64,6 +74,22 @@ export const DEFAULT_COUNCIL_QUORUM = 3;
 /** Hard ceiling so a typo cannot demand more jurors than exist. */
 export const MAX_COUNCIL_QUORUM = 20;
 
+/**
+ * Stable identifier for the quorum rule set. Bump the leading version only when
+ * the decision semantics change (not when defaults are tuned). The effective
+ * quorum is appended so the reference pins the parameter actually applied.
+ */
+export const QUORUM_POLICY_ID = "council-quorum/v1";
+
+/**
+ * Build the policy revision reference for an effective (normalized) quorum.
+ * Depends only on the effective parameter, so a default change that does not
+ * alter the effective value keeps prior references valid.
+ */
+export function policyRevisionFor(effectiveQuorum: number): string {
+  return `${QUORUM_POLICY_ID}:q=${effectiveQuorum}`;
+}
+
 export interface VoteAttemptInput {
   slug: string;
   /** Claim id the response claims to be about (from body or request). */
@@ -71,6 +97,8 @@ export interface VoteAttemptInput {
   /** Claim id the oracle is currently settling. */
   expectedClaimId: number;
   claimState: ClaimSettleState;
+  /** True when this persona is currently paused and must not vote. */
+  personaPaused?: boolean;
   /**
    * Transport outcome before JSON validation.
    * - `ok` — HTTP 2xx with a body to inspect
@@ -100,6 +128,8 @@ export interface ClassifiedVote {
 export interface QuorumEvaluation {
   action: FallbackAction;
   quorum: number;
+  /** Stable reference to the rule set (and effective quorum) that produced this decision. */
+  policyRevision: string;
   decisiveCount: number;
   acceptedCount: number;
   dispositions: Record<VoteDisposition, number>;
@@ -115,17 +145,75 @@ const EMPTY_DISPOSITIONS = (): Record<VoteDisposition, number> => ({
   stale: 0,
   duplicated: 0,
   cancelled: 0,
+  paused: 0,
   dependency_failure: 0,
 });
 
+/**
+ * Compare quorum/confidence policy outcomes across identical fixtures without
+ * contacting model providers. Each fixture is a list of raw vote attempts plus
+ * a quorum config; the result reports the evaluation under a baseline policy and
+ * a candidate policy, and flags any decisions that changed.
+ */
+export interface PolicyFixture {
+  name: string;
+  attempts: ClassifiedVote[];
+  quorum: unknown;
+  claimState?: ClaimSettleState;
+}
+
+export interface PolicyComparisonRow {
+  name: string;
+  baseline: FallbackAction;
+  candidate: FallbackAction;
+  changed: boolean;
+  baselineReason: string;
+  candidateReason: string;
+}
+
+export interface PolicyComparisonReport {
+  rows: PolicyComparisonRow[];
+  changedCount: number;
+}
+
+/**
+ * Run two quorum policies over the same fixtures and report changed decisions.
+ * Pure: no network, no provider calls, no persisted state.
+ */
+export function comparePolicies(
+  fixtures: PolicyFixture[],
+  baselineOpts: { quorum?: unknown; strictConfig?: boolean } = {},
+  candidateOpts: { quorum?: unknown; strictConfig?: boolean } = {},
+): PolicyComparisonReport {
+  const rows: PolicyComparisonRow[] = fixtures.map((fx) => {
+    const base = evaluateQuorum(fx.attempts, baselineOpts.quorum ?? fx.quorum, {
+      claimState: fx.claimState,
+      strictConfig: baselineOpts.strictConfig,
+    });
+    const cand = evaluateQuorum(fx.attempts, candidateOpts.quorum ?? fx.quorum, {
+      claimState: fx.claimState,
+      strictConfig: candidateOpts.strictConfig,
+    });
+    return {
+      name: fx.name,
+      baseline: base.action,
+      candidate: cand.action,
+      changed: base.action !== cand.action,
+      baselineReason: base.reason,
+      candidateReason: cand.reason,
+    };
+  });
+  return { rows, changedCount: rows.filter((r) => r.changed).length };
+}
+
 export function isDecisiveVerdict(verdict: Verdict): boolean {
-  return verdict === "CREATOR_WINS" || verdict === "CHALLENGERS_WIN";
+  return verdict === "CREATOR_WINS" || verdict === "CHALLENGERS_WINS";
 }
 
 /**
  * Normalize a raw quorum (env Number, caller override, …).
  *
- * Invalid values (NaN, non-finite, &lt; 1) become the default so a typo cannot
+ * Invalid values (NaN, non-finite, < 1) become the default so a typo cannot
  * silently disable the gate (`quorum: 0` would otherwise accept an empty jury).
  * Values above {@link MAX_COUNCIL_QUORUM} clamp rather than reject — demanding
  * more jurors than the roster has is a config smell, not a settle-time abort.
@@ -149,7 +237,7 @@ export function isInvalidQuorumConfig(raw: unknown): boolean {
 function clampConfidence(value: unknown): number {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(100, Math.round(n)));
+  return Math.max(0, Math.min(Math.round(n), 100));
 }
 
 /**
@@ -163,6 +251,15 @@ export function classifyVoteAttempt(input: VoteAttemptInput): ClassifiedVote {
       slug: "",
       disposition: "invalid",
       reason: "missing persona slug",
+      decisive: false,
+    };
+  }
+
+  if (input.personaPaused) {
+    return {
+      slug,
+      disposition: "paused",
+      reason: "persona is paused",
       decisive: false,
     };
   }
@@ -318,6 +415,10 @@ function countDispositions(
 /**
  * Decide whether the council ballot may settle the claim, or how to fall back.
  *
+ * Every returned evaluation carries `policyRevision`, derived from the effective
+ * quorum, so a recorded decision can be replayed deterministically under the
+ * same revision.
+ *
  * @param strictConfig — when set and {@link isInvalidQuorumConfig} is true,
  *   returns `abort_invalid_config` instead of normalizing.
  */
@@ -330,11 +431,14 @@ export function evaluateQuorum(
   },
 ): QuorumEvaluation {
   const claimState = opts?.claimState;
+  const quorum = normalizeQuorum(quorumRaw);
+  const policyRevision = policyRevisionFor(quorum);
 
   if (claimState === "cancelled") {
     return {
       action: "abort_cancelled",
-      quorum: normalizeQuorum(quorumRaw),
+      quorum,
+      policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
@@ -347,7 +451,8 @@ export function evaluateQuorum(
   if (claimState === "resolved") {
     return {
       action: "abort_resolved",
-      quorum: normalizeQuorum(quorumRaw),
+      quorum,
+      policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
@@ -357,10 +462,25 @@ export function evaluateQuorum(
     };
   }
 
+  if (claimState === "paused") {
+    return {
+      action: "abort_paused",
+      quorum,
+      policyRevision,
+      decisiveCount: 0,
+      acceptedCount: 0,
+      dispositions: countDispositions(attempts),
+      reason: "claim is paused — council settlement aborted",
+      acceptedSlugs: [],
+      ballot: [],
+    };
+  }
+
   if (opts?.strictConfig && isInvalidQuorumConfig(quorumRaw)) {
     return {
       action: "abort_invalid_config",
       quorum: 0,
+      policyRevision: policyRevisionFor(0),
       decisiveCount: 0,
       acceptedCount: 0,
       dispositions: countDispositions(attempts),
@@ -370,53 +490,25 @@ export function evaluateQuorum(
     };
   }
 
-  const quorum = normalizeQuorum(quorumRaw);
   const { ballot, rejected } = buildBallot(attempts);
   const all = [...ballot, ...rejected];
   const dispositions = countDispositions(all);
-  const decisiveCount = ballot.filter((v) => v.decisive).length;
-  const acceptedSlugs = ballot.map((v) => v.slug);
-
-  if (decisiveCount >= quorum) {
-    return {
-      action: "use_council",
-      quorum,
-      decisiveCount,
-      acceptedCount: ballot.length,
-      dispositions,
-      reason: `quorum met: ${decisiveCount} decisive ≥ ${quorum}`,
-      acceptedSlugs,
-      ballot,
-    };
-  }
-
-  const dep = dispositions.dependency_failure;
-  const reasonParts = [
-    `below quorum: ${decisiveCount} decisive < ${quorum}`,
-    dispositions.invalid ? `${dispositions.invalid} invalid` : null,
-    dispositions.stale ? `${dispositions.stale} stale` : null,
-    dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
-    dep ? `${dep} dependency_failure` : null,
-  ].filter(Boolean);
+  const decisive = ballot.filter((vote) => vote.decisive);
+  const decisiveCount = decisive.length;
+  const acceptedSlugs = ballot.map((vote) => vote.slug);
+  const met = decisiveCount >= quorum;
 
   return {
-    action: "fallback_solo",
+    action: met ? "use_council" : "fallback_solo",
     quorum,
+    policyRevision,
     decisiveCount,
     acceptedCount: ballot.length,
     dispositions,
-    reason: reasonParts.join("; "),
+    reason: met
+      ? `quorum met: ${decisiveCount}/${quorum} decisive votes`
+      : `below quorum: ${decisiveCount}/${quorum} decisive votes — solo fallback`,
     acceptedSlugs,
     ballot,
   };
-}
-
-/** True when the oracle should settle with its own evidence (not abort). */
-export function shouldFallbackSolo(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "fallback_solo";
-}
-
-/** True when council tally is authoritative for this settlement. */
-export function shouldUseCouncil(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "use_council";
 }
